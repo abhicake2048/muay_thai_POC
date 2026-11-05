@@ -1,0 +1,12 @@
+# Python environments and bytecode
+.venv-yolo/
+__pycache__/
+*.py[cod]
+
+# Generated datasets, training runs, and checkpoints
+generated/
+runs/
+
+# Local datasets
+mma-fighter-pose-estimation-dataset/
+Dataset/
