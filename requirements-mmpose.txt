@@ -1,0 +1,13 @@
+# Run install_mmpose_deps.py to install the matching PyTorch/MMCV wheels and
+# preinstall chumpy without build isolation.
+setuptools>=65,<81
+numpy>=1.24,<2.0
+chumpy==0.70
+mmengine>=0.10.0,<1.0.0
+mmdet==3.3.0
+mmpose==1.3.2
+pycocotools>=2.0.7,<3.0
+albumentations>=1.3.1,<2.0
+opencv-python-headless>=4.8,<5.0
+Pillow>=10.0
+ultralytics>=8.3.0,<9.0.0
