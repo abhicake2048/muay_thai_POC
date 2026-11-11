@@ -10,13 +10,14 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+os.environ["MPLBACKEND"] = "Agg"
 os.environ.setdefault("NO_ALBUMENTATIONS_UPDATE", "1")
 
 from custom_combat_skeleton import KEYPOINT_NAMES, SKELETON_LINKS
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
-DEFAULT_DETECTOR = PROJECT_ROOT / "weights" / "yolov11" / "best.pt"
+DEFAULT_DETECTOR = PROJECT_ROOT / "weights" / "yolo_fighter_detector" / "best.pt"
 DEFAULT_POSE_CONFIG = PROJECT_ROOT / "configs" / "rtmpose_s_combat.py"
 SKELETON_INDICES = [
     (KEYPOINT_NAMES.index(start), KEYPOINT_NAMES.index(end))

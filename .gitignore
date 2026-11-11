@@ -9,9 +9,19 @@ generated/
 runs/
 checkpoints/
 work_dirs/
+*.pt
 *.pth
 *.mp4
+*.zip
 
 # Local datasets
+datasets/
+mma-fighter-detection-dataset/
 mma-fighter-pose-estimation-dataset/
+mma-fighter-detection-dataset.zip
+mma-fighter-pose-estimation-dataset.zip
+punch-kick-player detection.v4i.yolov11.zip
+punch-kick-player detection.v4i.yolov11/
+kick-punch-fighter-detection-dataset.zip
+BoxingVI_dataset/
 Dataset/

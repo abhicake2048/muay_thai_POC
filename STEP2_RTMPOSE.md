@@ -28,11 +28,13 @@ counts, and renders 20 overlays for inspection.
 ```python
 %cd /content/Muay_thai
 !pip install -q uv
-!uv venv --python 3.11 .venv-mmpose
+!uv venv --python 3.11 --seed .venv-mmpose
 !.venv-mmpose/bin/python install_mmpose_deps.py --torch cu121
 ```
 
-If pip replaces NumPy, restart the runtime once and return to the repository.
+`--seed` installs pip into the new environment. The dependency installer also
+bootstraps pip automatically if an older command created an unseeded environment.
+The `uv` warning about `--system` is harmless and is unrelated to MMPose.
 
 4. Convert and visually inspect the annotations:
 
@@ -51,6 +53,10 @@ If pip replaces NumPy, restart the runtime once and return to the repository.
   --work-dir /content/drive/MyDrive/Muay_thai/rtmpose_smoke
 ```
 
+The scripts force Matplotlib's headless `Agg` backend. This prevents Colab's
+inherited `module://matplotlib_inline.backend_inline` setting from breaking the
+isolated MMPose environment.
+
 6. Run the full fine-tune. Batch 64 is the intended T4 setting; use 32 if GPU
    memory is insufficient:
 
@@ -61,6 +67,23 @@ If pip replaces NumPy, restart the runtime once and return to the repository.
   --workers 2 \
   --device cuda \
   --work-dir /content/drive/MyDrive/Muay_thai/rtmpose_s_combat
+```
+
+For higher T4 throughput, try batch 128 first. The trainer scales the learning
+rate automatically. Disabling flip-test and validating every 10 epochs reduces
+evaluation overhead while retaining best-checkpoint selection:
+
+```python
+!.venv-mmpose/bin/python train_rtmpose.py \
+  --epochs 50 \
+  --batch-size 128 \
+  --workers 4 \
+  --device cuda \
+  --amp \
+  --no-flip-test \
+  --val-interval 10 \
+  --checkpoint-interval 10 \
+  --work-dir /content/drive/MyDrive/Muay_thai/rtmpose_s_combat_fast
 ```
 
 Resume an interrupted run using the epoch checkpoint named in `last_checkpoint`:
@@ -113,7 +136,7 @@ not copy the source audio stream.
 
 ```powershell
 python infer_pose_video.py input.mp4 annotated.mp4 `
-  --detector weights/yolov11/best.pt `
+  --detector weights/yolo_fighter_detector/best.pt `
   --pose-checkpoint work_dirs/rtmpose_s_combat/best_coco_AP_epoch_XX.pth `
   --device cuda:0
 ```

@@ -28,6 +28,20 @@ def run(*arguments: str) -> None:
     subprocess.check_call(command)
 
 
+def ensure_pip() -> None:
+    """Bootstrap pip when uv created the environment without --seed."""
+    check = subprocess.run(
+        [sys.executable, "-m", "pip", "--version"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    if check.returncode == 0:
+        return
+    print("pip is missing; bootstrapping it with ensurepip...", flush=True)
+    subprocess.check_call([sys.executable, "-m", "ensurepip", "--upgrade"])
+
+
 def main() -> int:
     args = parse_args()
     if sys.version_info[:2] != (3, 11):
@@ -38,6 +52,7 @@ def main() -> int:
     requirements = PROJECT_ROOT / "requirements-mmpose.txt"
     if not requirements.is_file():
         raise FileNotFoundError(requirements)
+    ensure_pip()
     run("--upgrade", "pip", "setuptools<81", "wheel")
     run("numpy>=1.24,<2.0")
     run("chumpy==0.70", "--no-build-isolation")

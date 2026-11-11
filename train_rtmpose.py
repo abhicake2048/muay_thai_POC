@@ -10,6 +10,9 @@ import urllib.request
 from pathlib import Path
 
 
+# Colab exports its notebook-only inline backend to subprocesses. MMEngine runs
+# headlessly, so force a backend that is available inside the isolated venv.
+os.environ["MPLBACKEND"] = "Agg"
 os.environ.setdefault("NO_ALBUMENTATIONS_UPDATE", "1")
 
 
@@ -40,6 +43,30 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--workers", type=int, default=4)
+    parser.add_argument(
+        "--val-interval",
+        type=int,
+        default=5,
+        help="Run validation every N epochs.",
+    )
+    parser.add_argument(
+        "--checkpoint-interval",
+        type=int,
+        default=5,
+        help="Write a regular epoch checkpoint every N epochs.",
+    )
+    parser.add_argument(
+        "--flip-test",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use horizontal flip test-time augmentation during validation.",
+    )
+    parser.add_argument(
+        "--pin-memory",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use pinned host memory for faster CPU-to-GPU transfers.",
+    )
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
     parser.add_argument(
         "--amp",
@@ -68,8 +95,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--resume", type=Path, default=None)
     parser.add_argument("--download-only", action="store_true")
     args = parser.parse_args()
-    if args.epochs <= 0 or args.batch_size <= 0:
-        parser.error("--epochs and --batch-size must be greater than zero")
+    if any(
+        value <= 0
+        for value in (
+            args.epochs,
+            args.batch_size,
+            args.val_interval,
+            args.checkpoint_interval,
+        )
+    ):
+        parser.error(
+            "--epochs, --batch-size, --val-interval, and "
+            "--checkpoint-interval must be greater than zero"
+        )
     if args.workers < 0:
         parser.error("--workers cannot be negative")
     for option in ("train_samples", "validation_samples"):
@@ -169,8 +207,9 @@ def build_config(args: argparse.Namespace, checkpoint: Path, device: str):
     cfg.launcher = "none"
     cfg.randomness = dict(seed=args.seed, deterministic=False)
     cfg.train_cfg.max_epochs = args.epochs
-    cfg.train_cfg.val_interval = max(1, min(5, args.epochs))
-    cfg.default_hooks.checkpoint.interval = max(1, min(5, args.epochs))
+    cfg.train_cfg.val_interval = args.val_interval
+    cfg.default_hooks.checkpoint.interval = args.checkpoint_interval
+    cfg.model.test_cfg.flip_test = args.flip_test
     if os.name == "nt":
         cfg.env_cfg.mp_cfg.mp_start_method = "spawn"
 
@@ -183,6 +222,7 @@ def build_config(args: argparse.Namespace, checkpoint: Path, device: str):
         loader.batch_size = args.batch_size
         loader.num_workers = args.workers
         loader.persistent_workers = args.workers > 0
+        loader.pin_memory = args.pin_memory
         loader.dataset.data_root = str(data_root)
         loader.dataset.ann_file = str(annotation_dir / f"{split}.json")
         loader.dataset.data_prefix = dict(img="")
@@ -236,7 +276,10 @@ def build_config(args: argparse.Namespace, checkpoint: Path, device: str):
         cfg.resume = False
         cfg.load_from = str(checkpoint)
 
-    print(f"Device: {device}; AMP: {use_amp}; batch: {args.batch_size}; lr: {scaled_lr:g}")
+    print(
+        f"Device: {device}; AMP: {use_amp}; batch: {args.batch_size}; "
+        f"lr: {scaled_lr:g}; flip-test: {args.flip_test}"
+    )
     print(f"Work directory: {work_dir}")
     return cfg
 
