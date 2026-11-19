@@ -1,4 +1,4 @@
-"""Standalone RTMPose-S config for COCO-17 UFC/MMA fighter keypoints."""
+"""Standalone RTMPose-S config for combined COCO-17 combat keypoints."""
 
 custom_imports = dict(imports=["mmdet"], allow_failed_imports=False)
 default_scope = "mmpose"
@@ -129,7 +129,7 @@ model = dict(
 # Dataset
 dataset_type = "CocoDataset"
 data_mode = "topdown"
-data_root = "."
+data_root = "generated/combined_rtmpose_coco"
 metainfo = dict(from_file="custom_combat_skeleton.py")
 backend_args = None
 
@@ -213,7 +213,7 @@ train_dataloader = dict(
         type=dataset_type,
         data_root=data_root,
         data_mode=data_mode,
-        ann_file="generated/rtmpose_coco/annotations/train.json",
+        ann_file="annotations/train.json",
         data_prefix=dict(img=""),
         metainfo=metainfo,
         pipeline=train_pipeline,
@@ -230,7 +230,7 @@ val_dataloader = dict(
         type=dataset_type,
         data_root=data_root,
         data_mode=data_mode,
-        ann_file="generated/rtmpose_coco/annotations/val.json",
+        ann_file="annotations/val.json",
         data_prefix=dict(img=""),
         metainfo=metainfo,
         test_mode=True,
@@ -248,7 +248,7 @@ test_dataloader = dict(
         type=dataset_type,
         data_root=data_root,
         data_mode=data_mode,
-        ann_file="generated/rtmpose_coco/annotations/test.json",
+        ann_file="annotations/test.json",
         data_prefix=dict(img=""),
         metainfo=metainfo,
         test_mode=True,
@@ -258,11 +258,11 @@ test_dataloader = dict(
 
 val_evaluator = dict(
     type="CocoMetric",
-    ann_file="generated/rtmpose_coco/annotations/val.json",
+    ann_file="annotations/val.json",
 )
 test_evaluator = dict(
     type="CocoMetric",
-    ann_file="generated/rtmpose_coco/annotations/test.json",
+    ann_file="annotations/test.json",
 )
 
 custom_hooks = [

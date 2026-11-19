@@ -3,16 +3,44 @@
 .venv-mmpose/
 __pycache__/
 *.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
 
 # Generated datasets, training runs, and checkpoints
 generated/
 runs/
 checkpoints/
 work_dirs/
+weights/
+wandb/
+mlruns/
+lightning_logs/
+outputs/
 *.pt
 *.pth
+*.ckpt
+*.onnx
+*.engine
+*.torchscript
+*.safetensors
+*.tflite
 *.mp4
+*.avi
+*.mov
+*.mkv
+*.m4v
+*.webm
 *.zip
+*.7z
+*.rar
+*.tar
+*.tar.gz
+*.tgz
+*.log
+*.part
+*.tmp
 
 # Local datasets
 datasets/
@@ -25,3 +53,8 @@ punch-kick-player detection.v4i.yolov11/
 kick-punch-fighter-detection-dataset.zip
 BoxingVI_dataset/
 Dataset/
+
+# Operating-system metadata
+.DS_Store
+Thumbs.db
+desktop.ini

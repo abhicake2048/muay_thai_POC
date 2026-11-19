@@ -1,5 +1,10 @@
 # Colab training: YOLO11-S detector + RTMPose-S
 
+> **Combined pose datasets:** the RTMPose section below documents the older
+> single-dataset conversion. For the new merge/clean/deduplicate workflow, use
+> [`RTMPOSE_COMBINED_COLAB.ipynb`](RTMPOSE_COMBINED_COLAB.ipynb) or follow
+> [`RTMPOSE_COMBINED_COLAB.md`](RTMPOSE_COMBINED_COLAB.md).
+
 The two datasets have separate jobs:
 
 | Stage | Dataset | Annotation used |

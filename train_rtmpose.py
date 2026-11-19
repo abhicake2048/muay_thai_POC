@@ -1,4 +1,4 @@
-"""Download and fine-tune RTMPose-S on the converted UFC/MMA dataset."""
+"""Download and fine-tune RTMPose-S on a prepared COCO-17 combat dataset."""
 
 from __future__ import annotations
 
@@ -18,7 +18,8 @@ os.environ.setdefault("NO_ALBUMENTATIONS_UPDATE", "1")
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 DEFAULT_CONFIG = PROJECT_ROOT / "configs" / "rtmpose_s_combat.py"
-DEFAULT_ANNOTATIONS = PROJECT_ROOT / "generated" / "rtmpose_coco" / "annotations"
+DEFAULT_DATA_ROOT = PROJECT_ROOT / "generated" / "combined_rtmpose_coco"
+DEFAULT_ANNOTATIONS = DEFAULT_DATA_ROOT / "annotations"
 DEFAULT_WORK_DIR = PROJECT_ROOT / "work_dirs" / "rtmpose_s_combat"
 DEFAULT_CHECKPOINT = PROJECT_ROOT / "checkpoints" / "rtmpose-s-coco.pth"
 DEFAULT_CHECKPOINT_URL = (
@@ -33,7 +34,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--data-root",
         type=Path,
-        default=PROJECT_ROOT,
+        default=DEFAULT_DATA_ROOT,
         help="Root prepended to image paths stored in the COCO JSON files.",
     )
     parser.add_argument("--annotation-dir", type=Path, default=DEFAULT_ANNOTATIONS)
@@ -94,6 +95,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--resume", type=Path, default=None)
     parser.add_argument("--download-only", action="store_true")
+    parser.add_argument(
+        "--test-after-training",
+        action="store_true",
+        help="Evaluate the best saved checkpoint on test.json after training.",
+    )
     args = parser.parse_args()
     if any(
         value <= 0
@@ -145,28 +151,42 @@ def download_checkpoint(url: str, destination: Path) -> Path:
 
 
 def validate_data(annotation_dir: Path, data_root: Path) -> None:
-    expected = {
-        "train": (4074, 8094),
-        "val": (519, 1035),
-        "test": (513, 1026),
-    }
-    for split, counts in expected.items():
+    """Validate any cleaned COCO-17 dataset instead of one audited revision."""
+    for split in ("train", "val", "test"):
         path = annotation_dir / f"{split}.json"
         if not path.is_file():
             raise RuntimeError(
-                f"Missing {path}. Run 'python convert_to_coco.py' before training."
+                f"Missing {path}. Run 'python prepare_combined_pose_dataset.py' "
+                "before training."
             )
         payload = json.loads(path.read_text(encoding="utf-8"))
-        found = (len(payload.get("images", [])), len(payload.get("annotations", [])))
-        if found != counts:
-            raise RuntimeError(f"{split}: expected image/pose counts {counts}, found {found}")
+        images = payload.get("images", [])
+        annotations = payload.get("annotations", [])
+        if not images or not annotations:
+            raise RuntimeError(f"{split}: dataset split is empty")
+        image_ids = {image.get("id") for image in images}
+        if len(image_ids) != len(images):
+            raise RuntimeError(f"{split}: duplicate image IDs")
+        annotated_ids = {annotation.get("image_id") for annotation in annotations}
+        if not annotated_ids.issubset(image_ids):
+            raise RuntimeError(f"{split}: an annotation references a missing image")
+        if annotated_ids != image_ids:
+            raise RuntimeError(f"{split}: one or more images have no pose annotation")
+        for annotation in annotations:
+            keypoints = annotation.get("keypoints", [])
+            if len(keypoints) != 51:
+                raise RuntimeError(f"{split}: an annotation is not COCO-17")
+            visible = sum(1 for index in range(2, 51, 3) if keypoints[index] > 0)
+            if visible < 1 or annotation.get("num_keypoints") != visible:
+                raise RuntimeError(f"{split}: invalid keypoint visibility/count metadata")
         missing = [
             image["file_name"]
-            for image in payload["images"]
+            for image in images
             if not (data_root / image["file_name"]).is_file()
         ]
         if missing:
             raise RuntimeError(f"{split}: {len(missing)} COCO image paths do not exist")
+        print(f"{split:>5}: {len(images)} images, {len(annotations)} poses")
 
 
 def configure_device(requested: str) -> tuple[str, bool]:
@@ -307,6 +327,14 @@ def main() -> int:
             print(f"Best checkpoint: {best[-1].resolve()}")
         if latest.is_file():
             print(f"Latest checkpoint pointer: {latest.resolve()}")
+        if args.test_after_training:
+            if best:
+                print(f"Loading best checkpoint for test evaluation: {best[-1].resolve()}")
+                runner.load_checkpoint(str(best[-1].resolve()))
+            else:
+                print("No best checkpoint was saved; testing the final in-memory weights.")
+            metrics = runner.test()
+            print(f"Test metrics: {metrics}")
         return 0
     except (OSError, RuntimeError, ValueError, json.JSONDecodeError) as exc:
         print(f"Error: {exc}", file=sys.stderr)
