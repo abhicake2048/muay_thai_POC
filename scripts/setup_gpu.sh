@@ -51,7 +51,7 @@ PY
 source "$VENV_DIR/bin/activate"
 
 python -m pip install --upgrade \
-  pip "setuptools<81" wheel "Cython>=0.29.36,<3" "numpy>=1.26,<2"
+  pip "setuptools<81" wheel "Cython>=0.29.36,<3" "numpy==1.26.4"
 
 python -m pip install \
   torch==2.7.1 torchvision==0.22.1 \
