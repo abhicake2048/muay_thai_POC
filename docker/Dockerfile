@@ -39,9 +39,16 @@ RUN python -m pip install \
 # install it once without isolation before MMPose resolves its dependencies.
 RUN python -m pip install \
     --no-build-isolation "chumpy==0.70"
+# MMPose imports transformer heads eagerly, and those imports require the
+# mmcv._ext module even though this RTMPose/CSPNeXt configuration does not call
+# custom MMCV CUDA kernels.  Build the full MMCV package with CPU extension
+# symbols; PyTorch still runs the RTMPose model itself on CUDA.
+ARG MMCV_MAX_JOBS=1
+RUN MMCV_WITH_OPS=1 MAX_JOBS=${MMCV_MAX_JOBS} \
+    python -m pip install --no-build-isolation "mmcv==2.1.0"
 RUN python -m pip install -r /opt/mtdata/requirements-perception.txt
 RUN python -m pip check && python -c \
-    "import cv2, mmcv, mmdet, mmengine, numpy, torch, ultralytics, xtcocotools._mask; from mmpose.apis import inference_topdown, init_model; import mmpose; assert numpy.__version__ == '1.26.4', numpy.__version__; print('RTMPose imports OK'); print('numpy', numpy.__version__, 'opencv', cv2.__version__); print('torch', torch.__version__, 'CUDA wheel', torch.version.cuda); print('mmcv', mmcv.__version__, 'mmdet', mmdet.__version__, 'mmpose', mmpose.__version__)"
+    "import cv2, mmcv, mmcv._ext, mmdet, mmengine, numpy, torch, ultralytics, xtcocotools._mask; from mmpose.apis import inference_topdown, init_model; import mmpose; assert numpy.__version__ == '1.26.4', numpy.__version__; print('RTMPose imports OK'); print('numpy', numpy.__version__, 'opencv', cv2.__version__); print('torch', torch.__version__, 'CUDA wheel', torch.version.cuda); print('mmcv', mmcv.__version__, 'mmdet', mmdet.__version__, 'mmpose', mmpose.__version__)"
 
 FROM perception AS full
 COPY docker/requirements-full.txt /opt/mtdata/requirements-full.txt
