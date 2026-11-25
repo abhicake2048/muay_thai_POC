@@ -1,5 +1,11 @@
-transformers>=4.57
-accelerate>=1.0
-qwen-vl-utils
-fiftyone>=1.5
-sam2 @ git+https://github.com/facebookresearch/sam2.git
+# Qwen3-VL support without crossing the Transformers 5.x/Python 3.11 boundary.
+transformers==4.57.6
+accelerate==1.10.1
+qwen-vl-utils==0.0.14
+av==16.0.1
+huggingface-hub==0.36.0
+tokenizers==0.22.1
+safetensors==0.6.2
+# Immutable official Meta SAM2 commit containing the December 2024
+# multi-object video predictor update.  Do not use a moving Git branch here.
+sam2 @ git+https://github.com/facebookresearch/sam2.git@393ae336a752d26e68fb9a586e3d4ac14ff1e3c5

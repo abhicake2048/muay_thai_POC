@@ -18,26 +18,34 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 RUN python3 -m venv "$VIRTUAL_ENV"
 
+COPY docker/constraints.txt /opt/mtdata/constraints.txt
+
+# Pin the build frontend as well as the runtime packages.  This avoids a new
+# pip/setuptools release changing legacy chumpy/MMCV build behaviour.
 RUN python -m pip install --upgrade \
-    pip "setuptools<81" wheel "Cython>=0.29.36,<3" "numpy>=1.26,<2"
+    "pip==25.3" "setuptools==80.9.0" "wheel==0.45.1" \
+    "Cython==0.29.37" "numpy==1.26.4"
 
 RUN python -m pip install \
     torch==2.7.1 torchvision==0.22.1 \
+    -c /opt/mtdata/constraints.txt \
     --index-url https://download.pytorch.org/whl/cu128
 
 WORKDIR /workspace
 COPY pyproject.toml mtdata.py /opt/mtdata/
 COPY action_annotation_pipeline /opt/mtdata/action_annotation_pipeline
-RUN python -m pip install -e /opt/mtdata
+RUN python -m pip install --no-deps --no-build-isolation -e /opt/mtdata
 
 FROM base AS perception
 COPY docker/requirements-perception.txt /opt/mtdata/requirements-perception.txt
 RUN python -m pip install \
+    -c /opt/mtdata/constraints.txt \
     --only-binary=:all: "xtcocotools==1.14.3"
 # chumpy 0.70's legacy setup.py imports pip internals.  Modern PEP 517 build
 # isolation deliberately omits pip from the temporary build environment, so
 # install it once without isolation before MMPose resolves its dependencies.
 RUN python -m pip install \
+    -c /opt/mtdata/constraints.txt \
     --no-build-isolation "chumpy==0.70"
 # MMPose imports transformer heads eagerly, and those imports require the
 # mmcv._ext module even though this RTMPose/CSPNeXt configuration does not call
@@ -45,13 +53,34 @@ RUN python -m pip install \
 # symbols; PyTorch still runs the RTMPose model itself on CUDA.
 ARG MMCV_MAX_JOBS=1
 RUN MMCV_WITH_OPS=1 MAX_JOBS=${MMCV_MAX_JOBS} \
-    python -m pip install --no-build-isolation "mmcv==2.1.0"
-RUN python -m pip install -r /opt/mtdata/requirements-perception.txt
-RUN python -m pip check && python -c \
-    "import cv2, mmcv, mmcv._ext, mmdet, mmengine, numpy, torch, ultralytics, xtcocotools._mask; from mmpose.apis import inference_topdown, init_model; import mmpose; assert numpy.__version__ == '1.26.4', numpy.__version__; print('RTMPose imports OK'); print('numpy', numpy.__version__, 'opencv', cv2.__version__); print('torch', torch.__version__, 'CUDA wheel', torch.version.cuda); print('mmcv', mmcv.__version__, 'mmdet', mmdet.__version__, 'mmpose', mmpose.__version__)"
+    python -m pip install -c /opt/mtdata/constraints.txt \
+    --no-build-isolation "mmcv==2.1.0"
+RUN python -m pip install \
+    -c /opt/mtdata/constraints.txt \
+    -r /opt/mtdata/requirements-perception.txt
+RUN python -m pip check \
+    && python -m action_annotation_pipeline.dependency_check --profile perception \
+    && python -m pip freeze --all > /opt/mtdata/perception-environment.lock.txt
+CMD ["python", "mtdata.py", "doctor", "--profile", "perception"]
 
 FROM perception AS full
 COPY docker/requirements-full.txt /opt/mtdata/requirements-full.txt
-RUN python -m pip install -r /opt/mtdata/requirements-full.txt
+RUN SAM2_BUILD_CUDA=0 python -m pip install \
+    -c /opt/mtdata/constraints.txt \
+    --no-build-isolation \
+    -r /opt/mtdata/requirements-full.txt
+RUN python -m pip check \
+    && python -m action_annotation_pipeline.dependency_check --profile full \
+    && python -m pip freeze --all > /opt/mtdata/full-environment.lock.txt
+CMD ["python", "mtdata.py", "doctor", "--profile", "full"]
 
-CMD ["python", "mtdata.py", "doctor"]
+FROM base AS annotation
+COPY docker/requirements-annotation.txt /opt/mtdata/requirements-annotation.txt
+RUN python -m pip install \
+    -c /opt/mtdata/constraints.txt \
+    -r /opt/mtdata/requirements-annotation.txt
+RUN python -m pip check \
+    && python -m action_annotation_pipeline.dependency_check --profile annotation \
+    && python -m pip freeze --all > /opt/mtdata/annotation-environment.lock.txt
+
+CMD ["python", "mtdata.py", "doctor", "--profile", "annotation"]

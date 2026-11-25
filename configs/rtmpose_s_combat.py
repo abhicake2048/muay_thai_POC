@@ -127,6 +127,10 @@ model = dict(
 )
 
 # Dataset
+custom_imports = dict(
+    imports=["action_annotation_pipeline.mmpose_transforms"],
+    allow_failed_imports=False,
+)
 dataset_type = "CocoDataset"
 data_mode = "topdown"
 data_root = "generated/combined_rtmpose_coco"
@@ -141,23 +145,7 @@ train_pipeline = [
     dict(type="RandomBBoxTransform", scale_factor=[0.6, 1.4], rotate_factor=80),
     dict(type="TopdownAffine", input_size=codec["input_size"]),
     dict(type="mmdet.YOLOXHSVRandomAug"),
-    dict(
-        type="Albumentation",
-        transforms=[
-            dict(type="Blur", p=0.1),
-            dict(type="MedianBlur", p=0.1),
-            dict(
-                type="CoarseDropout",
-                max_holes=1,
-                max_height=0.4,
-                max_width=0.4,
-                min_holes=1,
-                min_height=0.2,
-                min_width=0.2,
-                p=0.5,
-            ),
-        ],
-    ),
+    dict(type="CombatBlurDropout", dropout_probability=0.5),
     dict(type="GenerateTarget", encoder=codec),
     dict(type="PackPoseInputs"),
 ]
@@ -175,23 +163,7 @@ train_pipeline_stage2 = [
     ),
     dict(type="TopdownAffine", input_size=codec["input_size"]),
     dict(type="mmdet.YOLOXHSVRandomAug"),
-    dict(
-        type="Albumentation",
-        transforms=[
-            dict(type="Blur", p=0.1),
-            dict(type="MedianBlur", p=0.1),
-            dict(
-                type="CoarseDropout",
-                max_holes=1,
-                max_height=0.4,
-                max_width=0.4,
-                min_holes=1,
-                min_height=0.2,
-                min_width=0.2,
-                p=0.25,
-            ),
-        ],
-    ),
+    dict(type="CombatBlurDropout", dropout_probability=0.25),
     dict(type="GenerateTarget", encoder=codec),
     dict(type="PackPoseInputs"),
 ]

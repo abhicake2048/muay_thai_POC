@@ -1,0 +1,34 @@
+.git
+.gitignore
+.venv*
+**/__pycache__
+**/*.py[cod]
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.ipynb_checkpoints
+
+# Runtime data and weights are mounted by Compose and must not be copied into
+# the build context.  Excluding them also prevents multi-gigabyte rebuilds.
+datasets
+generated
+models
+weights
+runs
+outputs
+yolov11_infer results
+*.mp4
+*.mkv
+*.avi
+*.mov
+*.pt
+*.pth
+*.onnx
+
+# Local documents and captured build logs are not Docker inputs.
+*.png
+*.jpg
+*.jpeg
+*.docx
+*.pdf
+*.ipynb

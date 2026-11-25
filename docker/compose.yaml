@@ -41,14 +41,14 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile
-      target: full
+      target: annotation
     ports:
       - "5151:5151"
     environment:
       HF_HUB_OFFLINE: "1"
       TRANSFORMERS_OFFLINE: "1"
       FIFTYONE_ADDRESS: "0.0.0.0"
-    command: ["python3", "mtdata.py", "doctor"]
+    command: ["python", "mtdata.py", "doctor", "--profile", "annotation"]
 
 volumes:
   hf_cache:

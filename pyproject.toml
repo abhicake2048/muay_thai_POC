@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=70"]
+requires = ["setuptools==80.9.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -7,7 +7,13 @@ name = "muay-thai-data-factory"
 version = "2.0.0"
 description = "Local-first temporal action data preparation for PoseC3D and TriDet"
 requires-python = ">=3.10,<3.13"
-dependencies = ["numpy>=1.26,<2", "opencv-python>=4.9,<4.12"]
+dependencies = ["numpy==1.26.4"]
+
+[project.optional-dependencies]
+# Keep the desktop and headless OpenCV wheels in separate environments.  They
+# both provide the same ``cv2`` namespace and must never be installed together.
+video = ["opencv-python==4.11.0.86"]
+review = ["opencv-python-headless==4.11.0.86", "fiftyone==1.10.0"]
 
 [project.scripts]
 mtdata = "action_annotation_pipeline.mtdata:main"

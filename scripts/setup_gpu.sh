@@ -2,15 +2,17 @@
 set -Eeuo pipefail
 
 PROFILE="${1:-perception}"
-if [[ "$PROFILE" != "perception" && "$PROFILE" != "full" ]]; then
-  echo "Usage: bash scripts/setup_gpu.sh [perception|full]" >&2
+if [[ "$PROFILE" != "perception" && "$PROFILE" != "full" && "$PROFILE" != "annotation" ]]; then
+  echo "Usage: bash scripts/setup_gpu.sh [perception|full|annotation]" >&2
   exit 2
 fi
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd)"
 PYTHON_BIN="${PYTHON_BIN:-python3.10}"
-VENV_DIR="${MTDATA_VENV:-$PROJECT_ROOT/.venv-gpu}"
+# Separate environments prevent the annotation profile's headless OpenCV wheel
+# from overwriting the perception profile's desktop OpenCV wheel.
+VENV_DIR="${MTDATA_VENV:-$PROJECT_ROOT/.venv-gpu-$PROFILE}"
 
 if ! command -v apt-get >/dev/null 2>&1; then
   echo "This setup script supports Ubuntu/Debian under Linux or WSL2." >&2
@@ -51,50 +53,62 @@ PY
 source "$VENV_DIR/bin/activate"
 
 python -m pip install --upgrade \
-  pip "setuptools<81" wheel "Cython>=0.29.36,<3" "numpy==1.26.4"
+  "pip==25.3" "setuptools==80.9.0" "wheel==0.45.1" \
+  "Cython==0.29.37" "numpy==1.26.4"
 
 python -m pip install \
   torch==2.7.1 torchvision==0.22.1 \
+  -c "$PROJECT_ROOT/docker/constraints.txt" \
   --index-url https://download.pytorch.org/whl/cu128
 
-python -m pip install -e "$PROJECT_ROOT"
-python -m pip install --only-binary=:all: "xtcocotools==1.14.3"
-python -m pip install --no-build-isolation "chumpy==0.70"
-python -m pip install -r "$PROJECT_ROOT/docker/requirements-perception.txt"
+python -m pip install --no-deps --no-build-isolation -e "$PROJECT_ROOT"
+
+if [[ "$PROFILE" == "annotation" ]]; then
+  python -m pip install \
+    -c "$PROJECT_ROOT/docker/constraints.txt" \
+    -r "$PROJECT_ROOT/docker/requirements-annotation.txt"
+else
+  python -m pip install \
+    -c "$PROJECT_ROOT/docker/constraints.txt" \
+    --only-binary=:all: "xtcocotools==1.14.3"
+  python -m pip install \
+    -c "$PROJECT_ROOT/docker/constraints.txt" \
+    --no-build-isolation "chumpy==0.70"
+  MMCV_WITH_OPS=1 MAX_JOBS="${MMCV_MAX_JOBS:-1}" \
+    python -m pip install \
+      -c "$PROJECT_ROOT/docker/constraints.txt" \
+      --no-build-isolation "mmcv==2.1.0"
+  python -m pip install \
+    -c "$PROJECT_ROOT/docker/constraints.txt" \
+    -r "$PROJECT_ROOT/docker/requirements-perception.txt"
+fi
 
 if [[ "$PROFILE" == "full" ]]; then
   # SAM2 can run without its optional post-processing CUDA extension.  Set
   # SAM2_BUILD_CUDA=1 before running this script if a matching CUDA toolkit
   # and nvcc are installed and that extension is desired.
   SAM2_BUILD_CUDA="${SAM2_BUILD_CUDA:-0}" \
-    python -m pip install -r "$PROJECT_ROOT/docker/requirements-full.txt"
+    python -m pip install \
+      -c "$PROJECT_ROOT/docker/constraints.txt" \
+      --no-build-isolation \
+      -r "$PROJECT_ROOT/docker/requirements-full.txt"
 fi
 
 python -m pip check
-python - <<'PY'
-import sys
-import torch
-import mmcv
-import mmengine
-import mmpose
-import ultralytics
-import xtcocotools
+if [[ "$PROFILE" == "annotation" ]]; then
+  python -m action_annotation_pipeline.dependency_check --profile annotation
+  python "$PROJECT_ROOT/mtdata.py" doctor --profile annotation
+else
+  python -m action_annotation_pipeline.dependency_check \
+    --profile "$PROFILE" --require-gpu
+  python "$PROJECT_ROOT/mtdata.py" doctor \
+    --profile "$PROFILE" --require-gpu
+fi
 
-print(f"Python: {sys.version.split()[0]}")
-print(f"PyTorch: {torch.__version__}")
-print(f"PyTorch CUDA runtime: {torch.version.cuda}")
-print(f"MMCV: {mmcv.__version__}")
-print(f"MMPose: {mmpose.__version__}")
-print(f"CUDA available: {torch.cuda.is_available()}")
-if not torch.cuda.is_available():
-    raise SystemExit("CUDA is not visible. Check the Windows NVIDIA driver and WSL GPU access.")
-print(f"GPU: {torch.cuda.get_device_name(0)}")
-PY
-
-python "$PROJECT_ROOT/mtdata.py" doctor
+python -m pip freeze --all > "$VENV_DIR/environment.lock.txt"
 
 echo
 echo "Setup completed. Activate it later with:"
 echo "  source '$VENV_DIR/bin/activate'"
 echo "Then run:"
-echo "  python '$PROJECT_ROOT/mtdata.py' doctor"
+echo "  python '$PROJECT_ROOT/mtdata.py' doctor --profile '$PROFILE'"

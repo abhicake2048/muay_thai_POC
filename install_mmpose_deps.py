@@ -53,8 +53,14 @@ def main() -> int:
     if not requirements.is_file():
         raise FileNotFoundError(requirements)
     ensure_pip()
-    run("--upgrade", "pip", "setuptools<81", "wheel")
-    run("numpy>=1.24,<2.0")
+    run(
+        "--upgrade",
+        "pip==25.3",
+        "setuptools==80.9.0",
+        "wheel==0.45.1",
+        "Cython==0.29.37",
+    )
+    run("numpy==1.26.4")
     run("chumpy==0.70", "--no-build-isolation")
     torch_index = (
         "https://download.pytorch.org/whl/cpu"
@@ -67,7 +73,7 @@ def main() -> int:
         "--index-url",
         torch_index,
     )
-    subprocess.call(
+    subprocess.check_call(
         [sys.executable, "-m", "pip", "uninstall", "-y", "mmcv", "mmcv-lite"]
     )
     mmcv_index = (
@@ -76,7 +82,17 @@ def main() -> int:
     )
     run("mmcv==2.1.0", "--find-links", mmcv_index)
     run("-r", str(requirements))
+    run("--no-deps", "--no-build-isolation", "-e", str(PROJECT_ROOT))
     subprocess.check_call([sys.executable, "-m", "pip", "check"])
+    subprocess.check_call(
+        [
+            sys.executable,
+            "-m",
+            "action_annotation_pipeline.dependency_check",
+            "--profile",
+            "rtmpose-training",
+        ]
+    )
     print("MMPose dependencies installed successfully.")
     return 0
 

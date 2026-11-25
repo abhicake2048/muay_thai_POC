@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import importlib.util
 import json
 import os
 import re
@@ -17,6 +16,7 @@ from .common import PIPELINE_ROOT, PROJECT_ROOT, PipelineError, read_json, read_
 from .schema import canonicalize_event
 from .state import StageState, stage_signature
 from .validate_events import validate
+from .dependency_check import audit_environment
 
 
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".mkv", ".avi", ".m4v", ".webm"}
@@ -255,21 +255,17 @@ def command_status(args: argparse.Namespace) -> int:
 
 
 def command_doctor(args: argparse.Namespace) -> int:
-    modules = ["cv2", "numpy", "torch", "ultralytics", "mmpose", "boxmot", "sam2", "transformers", "fiftyone"]
-    checks: dict[str, Any] = {name: importlib.util.find_spec(name) is not None for name in modules}
-    checks["ffmpeg"] = shutil.which("ffmpeg")
-    checks["docker"] = shutil.which("docker")
-    checks["wsl"] = shutil.which("wsl") or shutil.which("wsl.exe")
-    if checks["torch"]:
-        import torch
-        checks["cuda_available"] = torch.cuda.is_available()
-        checks["cuda_version"] = torch.version.cuda
-        checks["gpu"] = torch.cuda.get_device_name(0) if torch.cuda.is_available() else None
-        checks["bf16_supported"] = torch.cuda.is_bf16_supported() if torch.cuda.is_available() else False
-    checks["ready_core"] = all(checks.get(name) for name in ("cv2", "numpy", "torch", "ultralytics", "mmpose", "ffmpeg"))
-    checks["ready_full_optional"] = all(checks.get(name) for name in ("transformers", "fiftyone"))
+    checks = audit_environment(args.profile, args.require_gpu)
+    checks["executables"] = {
+        "ffmpeg": shutil.which("ffmpeg"),
+        "docker": shutil.which("docker"),
+        "wsl": shutil.which("wsl") or shutil.which("wsl.exe"),
+    }
+    if not checks["executables"]["ffmpeg"]:
+        checks["errors"].append("ffmpeg executable was not found")
+        checks["ok"] = False
     print(json.dumps(checks, indent=2, default=str))
-    return 0 if checks["ready_core"] else 1
+    return 0 if checks["ok"] else 1
 
 
 def command_train(args: argparse.Namespace) -> int:
@@ -379,6 +375,12 @@ def build_parser() -> argparse.ArgumentParser:
     status.set_defaults(func=command_status)
 
     doctor = subparsers.add_parser("doctor", help="Check local/GPU/optional dependencies")
+    doctor.add_argument(
+        "--profile",
+        choices=("auto", "base", "perception", "full", "annotation", "rtmpose-training"),
+        default="auto",
+    )
+    doctor.add_argument("--require-gpu", action="store_true")
     doctor.set_defaults(func=command_doctor)
 
     benchmark = subparsers.add_parser("benchmark-trackers", help="Select a tracker from reviewed fighter-ID clips")
