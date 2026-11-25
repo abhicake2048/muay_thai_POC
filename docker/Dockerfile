@@ -1,4 +1,8 @@
-FROM nvidia/cuda:12.8.1-cudnn-devel-ubuntu24.04 AS base
+# MMPose 1.3.2 requires xtcocotools.  xtcocotools 1.14.3 publishes Linux
+# wheels for CPython 3.10/3.11, but not CPython 3.12 (Ubuntu 24.04's
+# default).  Use Ubuntu 22.04/Python 3.10 so pip can install the supported
+# wheel instead of trying to compile the legacy extension from source.
+FROM nvidia/cuda:12.8.1-cudnn-devel-ubuntu22.04 AS base
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PIP_NO_CACHE_DIR=1 \
@@ -18,7 +22,8 @@ RUN python -m pip install --upgrade \
     pip "setuptools<81" wheel "Cython>=0.29.36,<3" "numpy>=1.26,<2"
 
 RUN python -m pip install \
-    torch torchvision --index-url https://download.pytorch.org/whl/cu128
+    torch==2.7.1 torchvision==0.22.1 \
+    --index-url https://download.pytorch.org/whl/cu128
 
 WORKDIR /workspace
 COPY pyproject.toml mtdata.py /opt/mtdata/
@@ -27,8 +32,8 @@ RUN python -m pip install -e /opt/mtdata
 
 FROM base AS perception
 COPY docker/requirements-perception.txt /opt/mtdata/requirements-perception.txt
-RUN python -m pip install --no-build-isolation \
-    "xtcocotools==1.14.3"
+RUN python -m pip install \
+    --only-binary=:all: "xtcocotools==1.14.3"
 RUN python -m pip install -r /opt/mtdata/requirements-perception.txt
 RUN python -m pip check && python -c \
     "import cv2, mmcv, mmengine, mmpose, torch, ultralytics, xtcocotools; print('perception imports OK'); print('torch', torch.__version__, 'CUDA wheel', torch.version.cuda); print('mmcv', mmcv.__version__, 'mmpose', mmpose.__version__)"
