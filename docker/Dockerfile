@@ -34,6 +34,11 @@ FROM base AS perception
 COPY docker/requirements-perception.txt /opt/mtdata/requirements-perception.txt
 RUN python -m pip install \
     --only-binary=:all: "xtcocotools==1.14.3"
+# chumpy 0.70's legacy setup.py imports pip internals.  Modern PEP 517 build
+# isolation deliberately omits pip from the temporary build environment, so
+# install it once without isolation before MMPose resolves its dependencies.
+RUN python -m pip install \
+    --no-build-isolation "chumpy==0.70"
 RUN python -m pip install -r /opt/mtdata/requirements-perception.txt
 RUN python -m pip check && python -c \
     "import cv2, mmcv, mmengine, mmpose, torch, ultralytics, xtcocotools; print('perception imports OK'); print('torch', torch.__version__, 'CUDA wheel', torch.version.cuda); print('mmcv', mmcv.__version__, 'mmpose', mmpose.__version__)"
