@@ -1,0 +1,297 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Muay Thai temporal action annotator</title>
+  <style>
+    :root { color-scheme: dark; font-family: Inter, Segoe UI, sans-serif; }
+    body { margin: 0; background: #101722; color: #e7edf5; }
+    header { padding: 14px 20px; background: #172334; border-bottom: 1px solid #33445c; }
+    h1 { margin: 0 0 4px; font-size: 20px; }
+    .hint { color: #aebdd0; font-size: 13px; }
+    main { display: grid; grid-template-columns: minmax(480px, 1.4fr) minmax(360px, 1fr); gap: 14px; padding: 14px; }
+    .panel { background: #172334; border: 1px solid #33445c; border-radius: 8px; padding: 12px; }
+    video { width: 100%; max-height: 58vh; background: #000; }
+    .row { display: flex; flex-wrap: wrap; gap: 8px; margin: 8px 0; align-items: end; }
+    label { display: grid; gap: 4px; color: #b9c7d9; font-size: 12px; }
+    input, select, textarea, button { color: #e7edf5; background: #0e1621; border: 1px solid #425673; border-radius: 5px; padding: 7px; }
+    input[type=file] { max-width: 250px; }
+    input[type=number] { width: 84px; }
+    textarea { width: 100%; min-height: 52px; box-sizing: border-box; }
+    button { cursor: pointer; background: #28476c; }
+    button:hover { background: #355d8d; }
+    button.primary { background: #176b4d; }
+    button.danger { background: #77333b; }
+    .time { font-variant-numeric: tabular-nums; font-size: 18px; }
+    .stamps { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+    .stamp { background: #0e1621; padding: 8px; border-radius: 6px; text-align: center; }
+    table { width: 100%; border-collapse: collapse; font-size: 12px; }
+    th, td { border-bottom: 1px solid #33445c; padding: 6px; text-align: left; }
+    tbody tr { cursor: pointer; }
+    tbody tr:hover, tbody tr.selected { background: #28415f; }
+    .table-wrap { max-height: 42vh; overflow: auto; }
+    .status { min-height: 22px; padding: 5px 0; color: #8bd7b6; }
+    .warning { color: #ffd27d; }
+    @media (max-width: 980px) { main { grid-template-columns: 1fr; } }
+  </style>
+</head>
+<body>
+<header>
+  <h1>Muay Thai temporal action annotator</h1>
+  <div class="hint">Choose the proxy/overlay video. Import proposals or an existing events JSONL. Shortcuts: S=start, P=peak, E=end, A=add/update, J/L=±1 frame.</div>
+</header>
+<main>
+  <section class="panel">
+    <div class="row">
+      <label>Video<input id="videoFile" type="file" accept="video/*"></label>
+      <label>Import JSONL<input id="jsonlFile" type="file" accept=".jsonl,.json,.txt"></label>
+      <label>Annotator<input id="annotator" value="reviewer_1"></label>
+    </div>
+    <video id="video" controls></video>
+    <div class="row">
+      <span class="time" id="currentTime">00:00.000</span>
+      <button id="backFrame">−1 frame</button>
+      <button id="forwardFrame">+1 frame</button>
+      <label>FPS<input id="fps" type="number" min="1" step="0.001" value="30"></label>
+      <label>Speed<select id="speed"><option>0.25</option><option>0.5</option><option selected>1</option><option>1.5</option><option>2</option></select></label>
+    </div>
+    <div class="stamps">
+      <div class="stamp"><button id="setStart">S: set start</button><div id="startDisplay">—</div></div>
+      <div class="stamp"><button id="setPeak">P: set peak</button><div id="peakDisplay">—</div></div>
+      <div class="stamp"><button id="setEnd">E: set end</button><div id="endDisplay">—</div></div>
+    </div>
+    <div class="row">
+      <label>Event type<select id="eventType"></select></label>
+      <label>Label<select id="label"></select></label>
+      <label>Actor<select id="actor"><option value="0">fighter 0</option><option value="1">fighter 1</option><option value="-1">global/N/A</option></select></label>
+      <label>Target<select id="target"><option value="1">fighter 1</option><option value="0">fighter 0</option><option value="-1">none/N/A</option></select></label>
+      <label>Round<input id="round" type="number" min="0" value="0"></label>
+    </div>
+    <div class="row">
+      <label>Anatomical side<select id="side"><option>unknown</option><option>left</option><option>right</option><option>bilateral</option><option>not_applicable</option></select></label>
+      <label>Effector limb<select id="effectorLimb"><option>unknown</option><option>hand</option><option>elbow</option><option>knee</option><option>leg</option><option>foot</option><option>both_arms</option><option>whole_body</option><option>not_applicable</option></select></label>
+      <label>Stance<select id="stance"><option>unknown</option><option>orthodox</option><option>southpaw</option><option>square</option><option>transitioning</option></select></label>
+      <label>Role<select id="stanceRole"><option>unknown</option><option>lead</option><option>rear</option><option>bilateral</option><option>not_applicable</option></select></label>
+    </div>
+    <div class="row">
+      <label>Target zone<select id="targetZone"><option>unknown</option><option>head</option><option>body</option><option>lead_leg</option><option>rear_leg</option><option>general_leg</option><option>not_applicable</option></select></label>
+      <label>Outcome<select id="outcome"><option>uncertain</option><option>attempted</option><option>clean_contact</option><option>partial_contact</option><option>blocked</option><option>caught</option><option>dodged</option><option>missed</option><option>not_applicable</option></select></label>
+      <label>Contact surface<select id="contactSurface"><option>unknown</option><option>fist</option><option>elbow</option><option>forearm</option><option>knee</option><option>shin</option><option>foot</option><option>not_applicable</option></select></label>
+      <label>Visibility<select id="visibility"><option>visible</option><option>partially_occluded</option><option>heavily_occluded</option><option>unknown</option></select></label>
+      <label>Status<select id="reviewStatus"><option>verified</option><option>uncertain</option><option>proposed</option><option>rejected</option></select></label>
+    </div>
+    <div class="row">
+      <label>Combo ID<input id="comboId" placeholder="optional"></label>
+      <label>Counter to event<input id="counterTo" placeholder="optional"></label>
+      <label>Possible cause<input id="possibleCause" placeholder="balance events"></label>
+    </div>
+    <label>Notes<textarea id="notes"></textarea></label>
+    <div class="row">
+      <button class="primary" id="save">A: add event</button>
+      <button id="clear">Clear form</button>
+      <button class="danger" id="delete">Delete selected</button>
+    </div>
+    <div id="status" class="status"></div>
+  </section>
+  <section class="panel">
+    <div class="row">
+      <button id="exportJsonl">Export events.jsonl</button>
+      <button id="exportCsv">Export events.csv</button>
+      <button id="sort">Sort by time</button>
+      <span id="count">0 events</span>
+    </div>
+    <p class="hint">Add one <b>review_range</b> covering every interval you watched exhaustively. Use <b>ignore</b> for unusable or unreviewed sections. Only verified action events become training labels.</p>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>#</th><th>Time</th><th>Actor</th><th>Type</th><th>Label</th><th>Status</th></tr></thead>
+        <tbody id="eventRows"></tbody>
+      </table>
+    </div>
+  </section>
+</main>
+<script>
+const labelSets = {
+  action: ['jab','cross','hook','uppercut','overhand','superman_punch','spinning_backfist','other_punch','roundhouse_kick','teep','side_kick','question_mark_kick','axe_kick','spinning_back_kick','other_kick','straight_knee','curved_knee','jumping_flying_knee','other_knee','horizontal_elbow','diagonal_elbow','upward_elbow','downward_elbow','spinning_elbow','other_elbow','clinch_entry','clinch_control','clinch_break','cover','block','parry','slip','duck','lean_back','step_evade','kick_check','kick_catch','frame','clinch_escape','other_defense','unknown_action'],
+  balance: ['knockdown','fall','trip','balance_slip','off_balance','sweep_dump'],
+  position: ['center_ring','ropes','corner','clinch_position'],
+  movement: ['forward_pressure','backward_pressure','lateral_movement','stance_switch'],
+  stance: ['orthodox','southpaw','square','transitioning','unknown'],
+  sequence: ['combination','counterattack','repeated_pattern','pace_change'],
+  review_range: ['reviewed'],
+  ignore: ['unreviewed','unusable','camera_cut','replay']
+};
+const familySets = {
+  punch: ['jab','cross','hook','uppercut','overhand','superman_punch','spinning_backfist','other_punch'],
+  kick: ['roundhouse_kick','teep','side_kick','question_mark_kick','axe_kick','spinning_back_kick','other_kick'],
+  knee: ['straight_knee','curved_knee','jumping_flying_knee','other_knee'],
+  elbow: ['horizontal_elbow','diagonal_elbow','upward_elbow','downward_elbow','spinning_elbow','other_elbow'],
+  clinch: ['clinch_entry','clinch_control','clinch_break'],
+  defense: ['cover','block','parry','slip','duck','lean_back','step_evade','kick_check','kick_catch','frame','clinch_escape','other_defense']
+};
+function actionFamily(label) { return Object.keys(familySets).find(f => familySets[f].includes(label)) || 'unknown'; }
+function effectorId(side, limb) { if (['left','right'].includes(side) && !['unknown','not_applicable','whole_body'].includes(limb)) return `${side}_${limb}`; if (side === 'bilateral' || ['both_arms','whole_body'].includes(limb)) return limb; return 'unknown'; }
+const eventTypes = Object.keys(labelSets);
+let events = [];
+let selectedIndex = -1;
+let stamps = {start: null, peak: null, end: null};
+const $ = id => document.getElementById(id);
+const video = $('video');
+
+function formatTime(value) {
+  if (value === null || value === undefined || Number.isNaN(Number(value))) return '—';
+  const seconds = Number(value), minutes = Math.floor(seconds / 60);
+  return `${String(minutes).padStart(2,'0')}:${(seconds % 60).toFixed(3).padStart(6,'0')}`;
+}
+function setStamp(name) {
+  stamps[name] = Number(video.currentTime.toFixed(6));
+  $(`${name}Display`).textContent = formatTime(stamps[name]);
+}
+function populateEventTypes() {
+  $('eventType').innerHTML = eventTypes.map(x => `<option>${x}</option>`).join('');
+  populateLabels();
+}
+function populateLabels(value) {
+  const labels = labelSets[$('eventType').value] || [];
+  $('label').innerHTML = labels.map(x => `<option>${x}</option>`).join('');
+  if (value && labels.includes(value)) $('label').value = value;
+}
+function applyTechniqueDefaults() {
+  if ($('eventType').value !== 'action') return;
+  const family = actionFamily($('label').value);
+  const limb = {punch:'hand',kick:'leg',knee:'knee',elbow:'elbow',clinch:'both_arms',defense:'whole_body'}[family] || 'unknown';
+  const surface = {punch:'fist',kick:'shin',knee:'knee',elbow:'elbow'}[family] || 'unknown';
+  $('effectorLimb').value = limb; $('contactSurface').value = surface;
+  if ($('label').value === 'jab') $('stanceRole').value = 'lead';
+  else if ($('label').value === 'cross') $('stanceRole').value = 'rear';
+}
+function autoTarget() {
+  const actor = Number($('actor').value);
+  if (actor === 0) $('target').value = '1';
+  else if (actor === 1) $('target').value = '0';
+}
+function clearForm() {
+  selectedIndex = -1;
+  stamps = {start: null, peak: null, end: null};
+  ['start','peak','end'].forEach(x => $(`${x}Display`).textContent = '—');
+  $('eventType').value = 'action'; populateLabels();
+  $('actor').value = '0'; $('target').value = '1'; $('round').value = '0';
+  $('side').value = 'unknown'; $('targetZone').value = 'unknown'; $('outcome').value = 'uncertain';
+  $('effectorLimb').value = 'unknown'; $('stance').value = 'unknown'; $('stanceRole').value = 'unknown';
+  $('contactSurface').value = 'unknown'; $('visibility').value = 'visible';
+  $('reviewStatus').value = 'verified'; $('comboId').value = ''; $('counterTo').value = '';
+  $('possibleCause').value = ''; $('notes').value = ''; $('save').textContent = 'A: add event';
+  render();
+}
+function buildEvent() {
+  if (stamps.start === null || stamps.end === null) throw new Error('Set start and end first.');
+  if (stamps.end <= stamps.start) throw new Error('End must be after start.');
+  const type = $('eventType').value;
+  const peak = stamps.peak === null ? (stamps.start + stamps.end) / 2 : stamps.peak;
+  if (peak < stamps.start || peak > stamps.end) throw new Error('Peak must be inside start/end.');
+  const previousId = selectedIndex >= 0 ? events[selectedIndex].event_id : null;
+  const id = previousId || `evt_${String(Date.now())}_${Math.floor(Math.random()*1000)}`;
+  const technique = $('label').value, side = $('side').value, limb = $('effectorLimb').value;
+  return {
+    event_id: id,
+    event_type: type,
+    actor_id: Number($('actor').value),
+    target_id: Number($('target').value),
+    start_sec: Number(stamps.start.toFixed(6)),
+    peak_sec: Number(peak.toFixed(6)),
+    end_sec: Number(stamps.end.toFixed(6)),
+    label: technique,
+    technique,
+    action_family: type === 'action' ? actionFamily(technique) : null,
+    anatomical_side: side,
+    side,
+    effector_limb: limb,
+    effector_id: effectorId(side, limb),
+    stance_at_start: $('stance').value,
+    stance_role: $('stanceRole').value,
+    target_zone: $('targetZone').value,
+    outcome: $('outcome').value,
+    contact_surface: $('contactSurface').value,
+    visibility: $('visibility').value,
+    occluded: ['partially_occluded','heavily_occluded'].includes($('visibility').value),
+    uncertainty_flags: [],
+    round: Number($('round').value || 0),
+    combo_id: $('comboId').value.trim() || null,
+    counter_to_event_id: $('counterTo').value.trim() || null,
+    possible_cause: $('possibleCause').value.trim() || null,
+    review_status: $('reviewStatus').value,
+    annotator: $('annotator').value.trim() || 'unknown',
+    notes: $('notes').value.trim(),
+    source: selectedIndex >= 0 && String(events[selectedIndex].source || '').includes('proposal') ? 'proposal_reviewed' : 'manual',
+    annotation_revision: selectedIndex >= 0 ? Number(events[selectedIndex].annotation_revision || 0) + 1 : 1,
+    provenance: {source: selectedIndex >= 0 ? 'review_edit' : 'manual', imported_event_id: previousId}
+  };
+}
+function saveEvent() {
+  try {
+    const value = buildEvent();
+    if (selectedIndex >= 0) events[selectedIndex] = value; else events.push(value);
+    events.sort((a,b) => a.start_sec - b.start_sec || a.actor_id - b.actor_id);
+    $('status').textContent = `Saved ${value.event_id}`;
+    clearForm();
+  } catch (error) { $('status').textContent = error.message; $('status').className = 'status warning'; }
+}
+function editEvent(index) {
+  selectedIndex = index; const e = events[index];
+  stamps = {start:Number(e.start_sec), peak:Number(e.peak_sec), end:Number(e.end_sec)};
+  ['start','peak','end'].forEach(x => $(`${x}Display`).textContent = formatTime(stamps[x]));
+  $('eventType').value = e.event_type || 'action'; populateLabels(e.label);
+  $('actor').value = String(e.actor_id ?? 0); $('target').value = String(e.target_id ?? -1);
+  $('round').value = e.round ?? 0; $('side').value = e.anatomical_side || e.side || 'unknown';
+  $('effectorLimb').value = e.effector_limb || 'unknown'; $('stance').value = e.stance_at_start || 'unknown';
+  $('stanceRole').value = e.stance_role || 'unknown'; $('contactSurface').value = e.contact_surface || 'unknown';
+  $('visibility').value = e.visibility || 'unknown';
+  $('targetZone').value = e.target_zone || 'unknown'; $('outcome').value = e.outcome || 'uncertain';
+  $('reviewStatus').value = e.review_status || 'proposed'; $('comboId').value = e.combo_id || '';
+  $('counterTo').value = e.counter_to_event_id || ''; $('possibleCause').value = e.possible_cause || '';
+  $('notes').value = e.notes || ''; $('save').textContent = 'A: update event';
+  video.currentTime = Math.max(0, Number(e.start_sec)); render();
+}
+function render() {
+  $('count').textContent = `${events.length} events`;
+  $('eventRows').innerHTML = events.map((e,i) => `<tr data-i="${i}" class="${i===selectedIndex?'selected':''}"><td>${i+1}</td><td>${formatTime(e.start_sec)}–${formatTime(e.end_sec)}</td><td>${e.actor_id ?? '—'}</td><td>${e.event_type || 'action'}</td><td>${e.label || '—'}</td><td>${e.review_status || '—'}</td></tr>`).join('');
+  document.querySelectorAll('#eventRows tr').forEach(row => row.onclick = () => editEvent(Number(row.dataset.i)));
+}
+function parseJsonl(text) {
+  const trimmed = text.trim(); if (!trimmed) return [];
+  if (trimmed.startsWith('[')) return JSON.parse(trimmed);
+  return trimmed.split(/\r?\n/).filter(Boolean).map(line => JSON.parse(line));
+}
+function download(name, text, mime='application/json') {
+  const blob = new Blob([text], {type:mime}); const url = URL.createObjectURL(blob);
+  const a = document.createElement('a'); a.href = url; a.download = name; a.click(); URL.revokeObjectURL(url);
+}
+function exportJsonl() { download('events.jsonl', events.map(e => JSON.stringify(e)).join('\n') + '\n'); }
+function csvEscape(value) { const s = value === null || value === undefined ? '' : String(value); return `"${s.replaceAll('"','""')}"`; }
+function exportCsv() {
+  const keys = ['event_id','event_type','actor_id','target_id','start_sec','peak_sec','end_sec','action_family','technique','anatomical_side','effector_limb','effector_id','stance_at_start','stance_role','target_zone','outcome','contact_surface','visibility','round','combo_id','counter_to_event_id','possible_cause','review_status','annotator','notes','source','annotation_revision'];
+  const rows = [keys.join(','), ...events.map(e => keys.map(k => csvEscape(e[k])).join(','))];
+  download('events.csv', rows.join('\n')+'\n', 'text/csv');
+}
+$('videoFile').onchange = e => { const file = e.target.files[0]; if (file) video.src = URL.createObjectURL(file); };
+$('jsonlFile').onchange = async e => { const file = e.target.files[0]; if (!file) return; try { events = parseJsonl(await file.text()); events.sort((a,b)=>a.start_sec-b.start_sec); clearForm(); $('status').textContent=`Imported ${events.length} events`; } catch(err) { $('status').textContent=`Import failed: ${err.message}`; } };
+video.ontimeupdate = () => $('currentTime').textContent = formatTime(video.currentTime);
+$('speed').onchange = () => video.playbackRate = Number($('speed').value);
+$('backFrame').onclick = () => video.currentTime = Math.max(0, video.currentTime - 1/Number($('fps').value));
+$('forwardFrame').onclick = () => video.currentTime = Math.min(video.duration || Infinity, video.currentTime + 1/Number($('fps').value));
+$('setStart').onclick = () => setStamp('start'); $('setPeak').onclick = () => setStamp('peak'); $('setEnd').onclick = () => setStamp('end');
+$('eventType').onchange = () => { populateLabels(); applyTechniqueDefaults(); }; $('label').onchange = applyTechniqueDefaults; $('actor').onchange = autoTarget;
+$('save').onclick = saveEvent; $('clear').onclick = clearForm;
+$('delete').onclick = () => { if (selectedIndex >= 0 && confirm('Delete selected event?')) { events.splice(selectedIndex,1); clearForm(); } };
+$('sort').onclick = () => { events.sort((a,b)=>a.start_sec-b.start_sec); render(); };
+$('exportJsonl').onclick = exportJsonl; $('exportCsv').onclick = exportCsv;
+document.addEventListener('keydown', event => {
+  if (['INPUT','SELECT','TEXTAREA'].includes(document.activeElement.tagName)) return;
+  const key = event.key.toLowerCase();
+  if (key === 's') setStamp('start'); else if (key === 'p') setStamp('peak'); else if (key === 'e') setStamp('end');
+  else if (key === 'a') saveEvent(); else if (key === 'j') $('backFrame').click(); else if (key === 'l') $('forwardFrame').click();
+});
+populateEventTypes(); clearForm();
+</script>
+</body>
+</html>

@@ -1,0 +1,17 @@
+{
+  "project_id": "sparring_1_actions_v1",
+  "video_id": "sparring_1",
+  "source_video": "datasets/videos/sparring_1.mp4",
+  "output_dir": "generated/action_annotations/sparring_1",
+  "class_schema": "action_annotation_pipeline/classes.json",
+  "yolo_weights": "weights/yolov11/best.pt",
+  "rtmpose_config": "weights/rtmpose/rtmpose_s_combat.py",
+  "rtmpose_checkpoint": "weights/rtmpose/best_coco_AP_epoch_70.pth",
+  "proxy_fps": 30.0,
+  "proxy_width": 1280,
+  "subset": "training",
+  "expected_fighters": 2,
+  "detector_confidence": 0.25,
+  "keypoint_confidence": 0.2,
+  "notes": "Temporal action annotation project for sparring_1.mp4. Model predictions are proposals and require human review."
+}

@@ -1,0 +1,49 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://local.muay-thai-data-factory/event-v2.schema.json",
+  "title": "Muay Thai temporal event v2",
+  "type": "object",
+  "required": ["event_id", "video_id", "event_type", "start_sec", "peak_sec", "end_sec", "review_status"],
+  "properties": {
+    "event_id": {"type": "string", "minLength": 1},
+    "video_id": {"type": "string", "minLength": 1},
+    "event_type": {"enum": ["action", "balance", "position", "movement", "stance", "sequence", "review_range", "ignore"]},
+    "actor_id": {"type": "integer"},
+    "target_id": {"type": "integer"},
+    "start_sec": {"type": "number", "minimum": 0},
+    "peak_sec": {"type": "number", "minimum": 0},
+    "end_sec": {"type": "number", "exclusiveMinimum": 0},
+    "proxy_start_frame": {"type": "integer", "minimum": 0},
+    "proxy_peak_frame": {"type": "integer", "minimum": 0},
+    "proxy_end_frame": {"type": "integer", "minimum": 0},
+    "source_start_frame": {"type": "integer", "minimum": 0},
+    "source_peak_frame": {"type": "integer", "minimum": 0},
+    "source_end_frame": {"type": "integer", "minimum": 0},
+    "action_family": {"enum": ["punch", "kick", "knee", "elbow", "clinch", "defense", "balance"]},
+    "technique": {"type": "string"},
+    "anatomical_side": {"enum": ["left", "right", "bilateral", "unknown", "not_applicable"]},
+    "effector_limb": {"enum": ["hand", "elbow", "knee", "leg", "foot", "both_arms", "whole_body", "unknown", "not_applicable"]},
+    "effector_id": {"type": "string"},
+    "stance_at_start": {"enum": ["orthodox", "southpaw", "square", "transitioning", "unknown"]},
+    "stance_role": {"enum": ["lead", "rear", "bilateral", "unknown", "not_applicable"]},
+    "target_zone": {"enum": ["head", "body", "lead_leg", "rear_leg", "general_leg", "unknown", "not_applicable"]},
+    "outcome": {"enum": ["attempted", "clean_contact", "partial_contact", "blocked", "caught", "dodged", "missed", "uncertain", "not_applicable"]},
+    "contact_surface": {"enum": ["fist", "elbow", "forearm", "knee", "shin", "foot", "unknown", "not_applicable"]},
+    "visibility": {"enum": ["visible", "partially_occluded", "heavily_occluded", "unknown"]},
+    "occluded": {"type": "boolean"},
+    "uncertainty_flags": {"type": "array", "items": {"type": "string"}, "uniqueItems": true},
+    "review_status": {"enum": ["proposed", "verified", "rejected", "uncertain"]},
+    "annotator": {"type": "string"},
+    "annotation_revision": {"type": "integer", "minimum": 1},
+    "provenance": {"type": "object"}
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"event_type": {"const": "action"}}},
+      "then": {
+        "required": ["actor_id", "target_id", "action_family", "technique", "anatomical_side", "effector_limb", "effector_id", "stance_at_start", "stance_role", "target_zone", "outcome", "contact_surface", "visibility"]
+      }
+    }
+  ],
+  "additionalProperties": true
+}

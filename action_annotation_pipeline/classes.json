@@ -1,0 +1,75 @@
+{
+  "schema_version": "2.0",
+  "action_families": {
+    "punch": ["jab", "cross", "hook", "uppercut", "overhand", "superman_punch", "spinning_backfist", "other_punch"],
+    "kick": ["roundhouse_kick", "teep", "side_kick", "question_mark_kick", "axe_kick", "spinning_back_kick", "other_kick"],
+    "knee": ["straight_knee", "curved_knee", "jumping_flying_knee", "other_knee"],
+    "elbow": ["horizontal_elbow", "diagonal_elbow", "upward_elbow", "downward_elbow", "spinning_elbow", "other_elbow"],
+    "clinch": ["clinch_entry", "clinch_control", "clinch_break"],
+    "defense": ["cover", "block", "parry", "slip", "duck", "lean_back", "step_evade", "kick_check", "kick_catch", "frame", "clinch_escape", "other_defense"]
+  },
+  "primary_action_classes": [
+    "jab", "cross", "hook", "uppercut", "overhand", "superman_punch", "spinning_backfist", "other_punch",
+    "roundhouse_kick", "teep", "side_kick", "question_mark_kick", "axe_kick", "spinning_back_kick", "other_kick",
+    "straight_knee", "curved_knee", "jumping_flying_knee", "other_knee",
+    "horizontal_elbow", "diagonal_elbow", "upward_elbow", "downward_elbow", "spinning_elbow", "other_elbow",
+    "clinch_entry", "clinch_control", "clinch_break",
+    "cover", "block", "parry", "slip", "duck", "lean_back", "step_evade", "kick_check", "kick_catch", "frame", "clinch_escape", "other_defense"
+  ],
+  "posec3d_classes": [
+    "jab", "cross", "hook", "uppercut", "overhand", "superman_punch", "spinning_backfist", "other_punch",
+    "roundhouse_kick", "teep", "side_kick", "question_mark_kick", "axe_kick", "spinning_back_kick", "other_kick",
+    "straight_knee", "curved_knee", "jumping_flying_knee", "other_knee",
+    "horizontal_elbow", "diagonal_elbow", "upward_elbow", "downward_elbow", "spinning_elbow", "other_elbow",
+    "clinch_entry", "clinch_control", "clinch_break",
+    "cover", "block", "parry", "slip", "duck", "lean_back", "step_evade", "kick_check", "kick_catch", "frame", "clinch_escape", "other_defense",
+    "knockdown", "fall", "trip", "balance_slip", "off_balance", "sweep_dump",
+    "background"
+  ],
+  "balance_classes": ["knockdown", "fall", "trip", "balance_slip", "off_balance", "sweep_dump"],
+  "trainable_event_classes": [
+    "jab", "cross", "hook", "uppercut", "overhand", "superman_punch", "spinning_backfist", "other_punch",
+    "roundhouse_kick", "teep", "side_kick", "question_mark_kick", "axe_kick", "spinning_back_kick", "other_kick",
+    "straight_knee", "curved_knee", "jumping_flying_knee", "other_knee",
+    "horizontal_elbow", "diagonal_elbow", "upward_elbow", "downward_elbow", "spinning_elbow", "other_elbow",
+    "clinch_entry", "clinch_control", "clinch_break",
+    "cover", "block", "parry", "slip", "duck", "lean_back", "step_evade", "kick_check", "kick_catch", "frame", "clinch_escape", "other_defense",
+    "knockdown", "fall", "trip", "balance_slip", "off_balance", "sweep_dump"
+  ],
+  "position_classes": ["center_ring", "ropes", "corner", "clinch_position"],
+  "movement_classes": ["forward_pressure", "backward_pressure", "lateral_movement", "stance_switch"],
+  "stance_classes": ["orthodox", "southpaw", "square", "transitioning", "unknown"],
+  "sequence_classes": ["combination", "counterattack", "repeated_pattern", "pace_change"],
+  "event_types": ["action", "balance", "position", "movement", "stance", "sequence", "review_range", "ignore"],
+  "anatomical_sides": ["left", "right", "bilateral", "unknown", "not_applicable"],
+  "sides": ["left", "right", "bilateral", "unknown", "not_applicable"],
+  "effector_limbs": ["hand", "elbow", "knee", "leg", "foot", "both_arms", "whole_body", "unknown", "not_applicable"],
+  "stance_roles": ["lead", "rear", "bilateral", "unknown", "not_applicable"],
+  "target_zones": ["head", "body", "lead_leg", "rear_leg", "general_leg", "unknown", "not_applicable"],
+  "outcomes": ["attempted", "clean_contact", "partial_contact", "blocked", "caught", "dodged", "missed", "uncertain", "not_applicable"],
+  "contact_surfaces": ["fist", "elbow", "forearm", "knee", "shin", "foot", "unknown", "not_applicable"],
+  "visibility_levels": ["visible", "partially_occluded", "heavily_occluded", "unknown"],
+  "review_statuses": ["proposed", "verified", "rejected", "uncertain"],
+  "v1_label_migrations": {
+    "lead_hook": {"technique": "hook", "stance_role": "lead"},
+    "rear_hook": {"technique": "hook", "stance_role": "rear"},
+    "lead_uppercut": {"technique": "uppercut", "stance_role": "lead"},
+    "rear_uppercut": {"technique": "uppercut", "stance_role": "rear"},
+    "low_kick": {"technique": "roundhouse_kick", "target_zone": "general_leg"},
+    "body_kick": {"technique": "roundhouse_kick", "target_zone": "body"},
+    "head_kick": {"technique": "roundhouse_kick", "target_zone": "head"},
+    "knee": {"technique": "other_knee"},
+    "elbow": {"technique": "other_elbow"},
+    "clinch": {"technique": "clinch_control"}
+  },
+  "definitions": {
+    "start_sec": "First committed movement of the action, not unrelated setup footwork.",
+    "peak_sec": "Contact, closest approach, or maximum extension.",
+    "end_sec": "Recovery toward guard or transition into the next action.",
+    "anatomical_side": "The acting fighter's anatomical left/right, never screen left/right.",
+    "stance_role": "Lead/rear role at action start; it is independent of anatomical side.",
+    "review_range": "An interval watched exhaustively. Empty time inside it may be background.",
+    "ignore": "Unusable or deliberately unreviewed time. It must never become background.",
+    "display_label": "Derived export label; canonical training truth remains factorized."
+  }
+}

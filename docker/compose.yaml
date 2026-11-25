@@ -1,0 +1,55 @@
+name: muay-thai-data-factory
+
+x-common: &common
+  working_dir: /workspace
+  volumes:
+    - ..:/workspace
+    - ../models:/workspace/models
+    - hf_cache:/root/.cache/huggingface
+    - torch_cache:/root/.cache/torch
+  environment:
+    HF_HUB_OFFLINE: "1"
+    TRANSFORMERS_OFFLINE: "1"
+  deploy:
+    resources:
+      reservations:
+        devices:
+          - driver: nvidia
+            count: 1
+            capabilities: [gpu]
+
+services:
+  perception:
+    <<: *common
+    profiles: [perception]
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      target: perception
+
+  full:
+    <<: *common
+    profiles: [full]
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      target: full
+
+  annotation:
+    <<: *common
+    profiles: [annotation]
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      target: full
+    ports:
+      - "5151:5151"
+    environment:
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+      FIFTYONE_ADDRESS: "0.0.0.0"
+    command: ["python3", "mtdata.py", "doctor"]
+
+volumes:
+  hf_cache:
+  torch_cache:

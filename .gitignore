@@ -18,6 +18,8 @@ wandb/
 mlruns/
 lightning_logs/
 outputs/
+models/
+.env
 *.pt
 *.pth
 *.ckpt
