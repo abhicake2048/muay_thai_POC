@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import sys
 from pathlib import Path
 
@@ -44,6 +45,9 @@ def main() -> int:
         if not proposal_path.is_file() or not proposal_path.stat().st_size:
             proposal_path = project / "proposals" / "action_proposals.jsonl"
         proposals = read_jsonl(proposal_path) if proposal_path.is_file() and proposal_path.stat().st_size else []
+        # Refresh the dependency-free reviewer for existing projects as the
+        # proposal evidence UI evolves; reviewed event files are untouched.
+        shutil.copy2(Path(__file__).parent / "annotator" / "index.html", project / "review" / "annotate.html")
         write_json(project / "review" / "cvat_label_contract.json", cvat_contract(schema))
         review_manifest = {
             "schema_version": "2.0", "project": manifest["project_id"],
@@ -75,6 +79,8 @@ def main() -> int:
                 )
                 for key in ("event_id", "actor_id", "target_id", "anatomical_side", "effector_limb", "effector_id", "stance_at_start", "stance_role", "target_zone", "outcome", "contact_surface", "visibility", "review_status"):
                     detection[key] = event.get(key)
+                detection["technique_candidates"] = json.dumps(event.get("technique_candidates", []), ensure_ascii=False)
+                detection["branch_evidence"] = json.dumps(event.get("branch_evidence", []), ensure_ascii=False)
                 detections.append(detection)
             sample["action_proposals"] = fo.TemporalDetections(detections=detections)
             dataset.add_sample(sample)

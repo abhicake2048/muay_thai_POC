@@ -1,164 +1,236 @@
-"""Generate high-motion action-window proposals from dense RTMPose sequences."""
+"""Generate high-recall action proposals from canonical RTMPose timelines."""
 
 from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
-from collections import defaultdict
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 
-from common import (
-    PipelineError,
-    canonical_fighter_for_track,
-    load_fighter_map,
-    load_manifest,
-    write_jsonl,
+from action_signals import (
+    build_fighter_timelines,
+    compute_action_signals,
+    family_candidates,
+    fighter_map_coverage,
+    hysteresis_bounds,
+    local_peaks,
+    require_fighter_map_coverage,
 )
+from common import PipelineError, load_fighter_map, load_manifest, write_json, write_jsonl
 from schema import effector_id
-
-
-UPPER_JOINTS = np.asarray([7, 8, 9, 10], dtype=int)  # elbows and wrists
-LOWER_JOINTS = np.asarray([13, 14, 15, 16], dtype=int)  # knees and ankles
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--project", type=Path, required=True)
-    parser.add_argument("--percentile", type=float, default=88.0)
-    parser.add_argument("--minimum-gap", type=float, default=0.45)
-    parser.add_argument("--pre-seconds", type=float, default=0.45)
-    parser.add_argument("--post-seconds", type=float, default=0.65)
+    parser.add_argument("--high-threshold", type=float, default=2.0)
+    parser.add_argument("--low-threshold", type=float, default=0.75)
+    parser.add_argument("--minimum-physical-speed", type=float, default=0.40)
+    parser.add_argument("--minimum-peak-gap", type=float, default=0.18)
+    parser.add_argument("--pre-seconds", type=float, default=0.35)
+    parser.add_argument("--post-seconds", type=float, default=0.45)
+    parser.add_argument("--max-gap-frames", type=int, default=6)
+    parser.add_argument("--smoothing-window", type=int, default=5)
     parser.add_argument("--overwrite", action="store_true")
-    parser.add_argument("--output", type=Path, help="Defaults to proposals/branches/pose_motion.jsonl")
+    parser.add_argument("--output", type=Path, help="Defaults to proposals/branches/pose_actionness.jsonl")
     return parser.parse_args()
 
 
-def normalized_speed(
-    points_a: np.ndarray,
-    points_b: np.ndarray,
-    scores_a: np.ndarray,
-    scores_b: np.ndarray,
-    dt: float,
-    diagonal: float,
-) -> np.ndarray:
-    valid = (scores_a >= 0.15) & (scores_b >= 0.15)
-    speed = np.zeros(points_a.shape[0], dtype=np.float32)
-    if dt > 0 and diagonal > 1:
-        speed[valid] = np.linalg.norm(points_b[valid] - points_a[valid], axis=1) / diagonal / dt
-    return speed
+def _target_zone(signal: dict[str, Any], peak: int) -> tuple[str, dict[str, float]]:
+    values = {zone: float(scores[peak]) for zone, scores in signal["zone_convergence"].items()}
+    zone, score = max(values.items(), key=lambda item: item[1])
+    return (zone if score > 0.05 else "unknown"), values
+
+
+def _event(
+    serial: int,
+    manifest: dict[str, Any],
+    actor: int,
+    effector_name: str,
+    signal: dict[str, Any],
+    peak: int,
+    onset: int,
+    offset: int,
+    fps: float,
+    duration: float,
+    pre_seconds: float,
+    post_seconds: float,
+) -> dict[str, Any]:
+    peak_sec = peak / fps
+    action_start = onset / fps
+    action_end = offset / fps
+    families, limb, family_hint = family_candidates(signal, peak)
+    target_zone, target_evidence = _target_zone(signal, peak)
+    side = str(signal["side"])
+    confidence = min(0.99, 0.45 + 0.12 * float(signal["actionness"][peak]))
+    return {
+        "event_id": f"pose_action_{serial:06d}",
+        "video_id": manifest["video_id"],
+        "event_type": "action",
+        "actor_id": actor,
+        "target_id": 1 - actor if actor in (0, 1) else -1,
+        "start_sec": round(max(0.0, action_start - pre_seconds), 6),
+        "peak_sec": round(peak_sec, 6),
+        "end_sec": round(min(duration, action_end + post_seconds), 6),
+        "action_start_sec": round(action_start, 6),
+        "action_end_sec": round(action_end, 6),
+        "label": "unknown_action",
+        "technique": "unknown_action",
+        "technique_candidates": [],
+        "action_family": "unknown",
+        "family_candidates": families,
+        "suggested_family": family_hint,
+        "anatomical_side": side,
+        "side": side,
+        "effector_limb": limb,
+        "effector_id": effector_id(side, limb),
+        "pose_effector_id": effector_name,
+        "stance_at_start": "unknown",
+        "stance_role": "unknown",
+        "target_zone": target_zone,
+        "outcome": "uncertain",
+        "contact_surface": "unknown",
+        "visibility": "visible" if float(signal["confidence"][peak]) >= 0.35 else "partially_occluded",
+        "occluded": bool(float(signal["confidence"][peak]) < 0.35),
+        "uncertainty_flags": ["technique_unclassified"],
+        "round": 0,
+        "combo_id": None,
+        "counter_to_event_id": None,
+        "possible_cause": None,
+        "review_status": "proposed",
+        "annotator": "automatic_pose_actionness",
+        "notes": f"pose actionness={float(signal['actionness'][peak]):.3f}; effector={effector_name}",
+        "source": "proposal",
+        "proposal_branch": "pose_actionness",
+        "proposal_confidence": round(confidence, 6),
+        "attribute_confidence": round(float(signal["confidence"][peak]), 6),
+        "actionness_score": round(float(signal["actionness"][peak]), 6),
+        "annotation_revision": 1,
+        "provenance": {
+            "source": "pose_actionness",
+            "effector": effector_name,
+            "peak_frame": peak,
+            "evidence": {
+                "raw_score": round(float(signal["raw"][peak]), 6),
+                "distal_speed": round(float(signal["distal_speed"][peak]), 6),
+                "middle_speed": round(float(signal["middle_speed"][peak]), 6),
+                "acceleration": round(float(signal["acceleration"][peak]), 6),
+                "extension_speed": round(float(signal["extension_speed"][peak]), 6),
+                "target_convergence": round(float(signal["convergence"][peak]), 6),
+                "target_zone_convergence": {key: round(value, 6) for key, value in target_evidence.items()},
+                "pose_confidence": round(float(signal["confidence"][peak]), 6),
+                "robust_statistics": signal["statistics"],
+            },
+        },
+    }
+
+
+def generate_proposals(
+    data: Any,
+    manifest: dict[str, Any],
+    fighter_map: dict[str, Any],
+    *,
+    high_threshold: float = 2.0,
+    low_threshold: float = 0.75,
+    minimum_physical_speed: float = 0.40,
+    minimum_peak_gap: float = 0.18,
+    pre_seconds: float = 0.35,
+    post_seconds: float = 0.45,
+    max_gap_frames: int = 6,
+    smoothing_window: int = 5,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    fps = float(manifest["proxy_video"]["fps"])
+    duration = float(manifest["proxy_video"]["duration_sec"])
+    expected = int(manifest.get("expected_fighters", 2))
+    coverage = fighter_map_coverage(
+        fighter_map,
+        np.asarray(data["timestamps"]),
+        np.asarray(data["track_ids"]),
+        expected,
+    )
+    require_fighter_map_coverage(coverage)
+    timelines, timeline_report = build_fighter_timelines(
+        data,
+        fighter_map,
+        expected,
+        fps,
+        max_gap_frames=max_gap_frames,
+        smoothing_window=smoothing_window,
+    )
+    proposals: list[dict[str, Any]] = []
+    signal_summary: dict[str, Any] = {}
+    serial = 1
+    separation_frames = max(1, int(math.ceil(minimum_peak_gap * fps)))
+    for actor, timeline in timelines.items():
+        opponent = timelines.get(1 - actor) if actor in (0, 1) else None
+        signals = compute_action_signals(timeline, opponent, fps)
+        signal_summary[str(actor)] = {}
+        for effector_name, signal in signals.items():
+            peaks = local_peaks(signal["actionness"], high_threshold, separation_frames)
+            peaks = [peak for peak in peaks if float(signal["distal_speed"][peak]) >= minimum_physical_speed]
+            # A low-variance sequence can make a strict robust threshold too
+            # conservative. Keep one physically meaningful fallback peak so
+            # the reviewer sees evidence instead of a silent empty file.
+            if not peaks and len(signal["raw"]) > 2:
+                fallback = int(np.argmax(signal["raw"]))
+                if 0 < fallback < len(signal["raw"]) - 1 and float(signal["distal_speed"][fallback]) >= minimum_physical_speed:
+                    peaks = [fallback]
+            signal_summary[str(actor)][effector_name] = {
+                "peaks": len(peaks),
+                "maximum_actionness": round(float(np.max(signal["actionness"])), 6),
+                "maximum_raw_score": round(float(np.max(signal["raw"])), 6),
+                "statistics": signal["statistics"],
+            }
+            for peak in peaks:
+                onset, offset = hysteresis_bounds(signal["actionness"], peak, low_threshold)
+                proposals.append(_event(
+                    serial, manifest, actor, effector_name, signal, peak, onset, offset,
+                    fps, duration, pre_seconds, post_seconds,
+                ))
+                serial += 1
+    proposals.sort(key=lambda row: (float(row["start_sec"]), int(row["actor_id"]), float(row["peak_sec"])))
+    report = {"coverage": coverage, "timeline": timeline_report, "signals": signal_summary, "proposal_count": len(proposals)}
+    return proposals, report
 
 
 def main() -> int:
     args = parse_args()
     try:
-        if not 50 <= args.percentile <= 99.9:
-            raise PipelineError("--percentile must be between 50 and 99.9")
+        if args.high_threshold <= args.low_threshold:
+            raise PipelineError("--high-threshold must be greater than --low-threshold")
+        if args.smoothing_window < 1 or args.smoothing_window % 2 == 0:
+            raise PipelineError("--smoothing-window must be a positive odd integer")
         project = args.project.expanduser().resolve()
         manifest = load_manifest(project)
         fighter_map = load_fighter_map(project)
         poses_path = project / "poses" / "poses.npz"
-        output = args.output.expanduser().resolve() if args.output else project / "proposals" / "branches" / "pose_motion.jsonl"
+        output = args.output.expanduser().resolve() if args.output else project / "proposals" / "branches" / "pose_actionness.jsonl"
         if not poses_path.is_file():
             raise PipelineError(f"Pose file not found: {poses_path}")
         if output.exists() and output.stat().st_size and not args.overwrite:
             raise PipelineError(f"Proposals already exist: {output}; pass --overwrite")
         data = np.load(poses_path)
-        frames = data["frame_indices"]
-        times = data["timestamps"]
-        raw_tracks = data["track_ids"]
-        boxes = data["bboxes_xyxy"]
-        points = data["keypoints"]
-        scores = data["keypoint_scores"]
-        duration = float(manifest["proxy_video"]["duration_sec"])
-
-        grouped: dict[int, list[int]] = defaultdict(list)
-        for index, raw_track in enumerate(raw_tracks):
-            grouped[int(raw_track)].append(index)
-
-        proposals: list[dict[str, object]] = []
-        serial = 1
-        for raw_track, indices_list in grouped.items():
-            indices = np.asarray(sorted(indices_list, key=lambda i: frames[i]), dtype=int)
-            if len(indices) < 4:
-                continue
-            motion_rows: list[tuple[float, float, float]] = []
-            for previous, current in zip(indices[:-1], indices[1:]):
-                dt = float(times[current] - times[previous])
-                if dt <= 0 or dt > 0.25:
-                    continue
-                x1, y1, x2, y2 = boxes[current]
-                diagonal = float(np.hypot(x2 - x1, y2 - y1))
-                velocity = normalized_speed(points[previous], points[current], scores[previous], scores[current], dt, diagonal)
-                upper = float(np.max(velocity[UPPER_JOINTS]))
-                lower = float(np.max(velocity[LOWER_JOINTS]))
-                motion_rows.append((float(times[current]), upper, lower))
-            if len(motion_rows) < 4:
-                continue
-            values = np.asarray([max(upper, lower) for _, upper, lower in motion_rows], dtype=np.float32)
-            threshold = max(0.15, float(np.percentile(values, args.percentile)))
-            candidate_indices = [i for i in range(1, len(motion_rows) - 1) if values[i] >= threshold and values[i] >= values[i - 1] and values[i] >= values[i + 1]]
-            selected: list[int] = []
-            for candidate in sorted(candidate_indices, key=lambda i: values[i], reverse=True):
-                timestamp = motion_rows[candidate][0]
-                if all(abs(timestamp - motion_rows[other][0]) >= args.minimum_gap for other in selected):
-                    selected.append(candidate)
-            for candidate in sorted(selected, key=lambda i: motion_rows[i][0]):
-                peak, upper, lower = motion_rows[candidate]
-                fighter_id = canonical_fighter_for_track(fighter_map, raw_track, peak)
-                if fighter_id is None:
-                    continue
-                family = "punch_or_elbow" if upper > lower * 1.12 else "kick_or_knee" if lower > upper * 1.12 else "unknown_action"
-                limb = "hand" if family == "punch_or_elbow" else "leg" if family == "kick_or_knee" else "unknown"
-                start = max(0.0, peak - args.pre_seconds)
-                end = min(duration, peak + args.post_seconds)
-                proposals.append({
-                    "event_id": f"proposal_{serial:06d}",
-                    "video_id": manifest["video_id"],
-                    "event_type": "action",
-                    "actor_id": fighter_id,
-                    "target_id": 1 - fighter_id if fighter_id in (0, 1) else -1,
-                    "start_sec": round(start, 6),
-                    "peak_sec": round(peak, 6),
-                    "end_sec": round(end, 6),
-                    "label": "unknown_action",
-                    "technique": "unknown_action",
-                    "action_family": "unknown",
-                    "suggested_family": family,
-                    "anatomical_side": "unknown",
-                    "side": "unknown",
-                    "effector_limb": limb,
-                    "effector_id": effector_id("unknown", limb),
-                    "stance_at_start": "unknown",
-                    "stance_role": "unknown",
-                    "target_zone": "unknown",
-                    "outcome": "uncertain",
-                    "contact_surface": "unknown",
-                    "visibility": "unknown",
-                    "occluded": False,
-                    "uncertainty_flags": ["technique_unclassified", "side_unclassified"],
-                    "round": 0,
-                    "combo_id": None,
-                    "counter_to_event_id": None,
-                    "possible_cause": None,
-                    "review_status": "proposed",
-                    "annotator": "automatic_pose_motion",
-                    "notes": f"motion score={values[candidate]:.4f}; family={family}; raw_track={raw_track}",
-                    "source": "proposal",
-                    "proposal_branch": "pose_motion",
-                    "proposal_confidence": round(float(min(1.0, values[candidate] / max(threshold, 1e-6))), 6),
-                    "annotation_revision": 1,
-                    "provenance": {"source": "pose_motion", "raw_track_id": raw_track},
-                })
-                serial += 1
-        proposals.sort(key=lambda row: (float(row["start_sec"]), int(row["actor_id"])))
+        proposals, report = generate_proposals(
+            data,
+            manifest,
+            fighter_map,
+            high_threshold=args.high_threshold,
+            low_threshold=args.low_threshold,
+            minimum_physical_speed=args.minimum_physical_speed,
+            minimum_peak_gap=args.minimum_peak_gap,
+            pre_seconds=args.pre_seconds,
+            post_seconds=args.post_seconds,
+            max_gap_frames=args.max_gap_frames,
+            smoothing_window=args.smoothing_window,
+        )
         write_jsonl(output, proposals)
-        legacy_output = project / "proposals" / "action_proposals.jsonl"
-        if output != legacy_output:
-            write_jsonl(legacy_output, proposals)
-        print(json.dumps({"proposals": len(proposals), "output": str(output)}, indent=2))
+        write_jsonl(project / "proposals" / "action_proposals.jsonl", proposals)
+        write_json(project / "qa" / "pose_actionness_report.json", report)
+        print(json.dumps({"proposals": len(proposals), "output": str(output), "report": str(project / 'qa' / 'pose_actionness_report.json')}, indent=2))
         return 0
     except (OSError, ValueError, PipelineError) as exc:
         print(f"Error: {exc}", file=sys.stderr)

@@ -87,11 +87,18 @@ def infer(proposals: list[dict[str, Any]], project: Path, window: float) -> list
             (side, limb): _motion_score(points, scores, SIDE_JOINTS[side][limb])
             for side in ("left", "right") for limb in limb_choices
         }
-        (side, limb), best = max(scores_by_effector.items(), key=lambda item: item[1])
+        (estimated_side, estimated_limb), best = max(scores_by_effector.items(), key=lambda item: item[1])
         ordered = sorted(scores_by_effector.values(), reverse=True)
         margin = (best - ordered[1]) / max(best, 1e-6) if len(ordered) > 1 else 0.0
         if best <= 0 or margin < 0.08:
-            side = "unknown"
+            estimated_side = "unknown"
+        proposed_side = str(value.get("anatomical_side", value.get("side", "unknown")))
+        proposed_limb = str(value.get("effector_limb", "unknown"))
+        # The actionness branch knows which anatomical limb generated its
+        # peak. Preserve that evidence; the window-wide estimator is a fallback
+        # for legacy motion proposals.
+        side = proposed_side if proposed_side in {"left", "right"} else estimated_side
+        limb = proposed_limb if proposed_limb not in {"", "unknown", "not_applicable"} else estimated_limb
         target = int(value.get("target_id", -1))
         target_track = raw_track_for_fighter(fighter_map, target, peak) if target >= 0 else None
         opponent_x = None
@@ -129,7 +136,7 @@ def main() -> int:
     args = parse_args()
     try:
         project = args.project.expanduser().resolve()
-        source = args.input.expanduser().resolve() if args.input else project / "proposals" / "branches" / "pose_motion.jsonl"
+        source = args.input.expanduser().resolve() if args.input else project / "proposals" / "branches" / "pose_actionness.jsonl"
         output = args.output.expanduser().resolve() if args.output else project / "proposals" / "branches" / "pose_attributes.jsonl"
         if output.exists() and output.stat().st_size and not args.overwrite:
             raise PipelineError(f"Output exists: {output}; use --overwrite")

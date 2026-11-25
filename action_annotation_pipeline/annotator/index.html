@@ -33,6 +33,7 @@
     .table-wrap { max-height: 42vh; overflow: auto; }
     .status { min-height: 22px; padding: 5px 0; color: #8bd7b6; }
     .warning { color: #ffd27d; }
+    .evidence { background:#0e1621; border:1px solid #33445c; border-radius:6px; padding:8px; margin:8px 0; white-space:pre-wrap; font-size:12px; color:#bfd2e8; }
     @media (max-width: 980px) { main { grid-template-columns: 1fr; } }
   </style>
 </head>
@@ -87,6 +88,7 @@
       <label>Possible cause<input id="possibleCause" placeholder="balance events"></label>
     </div>
     <label>Notes<textarea id="notes"></textarea></label>
+    <div id="evidence" class="evidence">Select a proposal to inspect ranked techniques and branch evidence.</div>
     <div class="row">
       <button class="primary" id="save">A: add event</button>
       <button id="clear">Clear form</button>
@@ -181,6 +183,7 @@ function clearForm() {
   $('contactSurface').value = 'unknown'; $('visibility').value = 'visible';
   $('reviewStatus').value = 'verified'; $('comboId').value = ''; $('counterTo').value = '';
   $('possibleCause').value = ''; $('notes').value = ''; $('save').textContent = 'A: add event';
+  $('evidence').textContent = 'Select a proposal to inspect ranked techniques and branch evidence.';
   render();
 }
 function buildEvent() {
@@ -189,7 +192,8 @@ function buildEvent() {
   const type = $('eventType').value;
   const peak = stamps.peak === null ? (stamps.start + stamps.end) / 2 : stamps.peak;
   if (peak < stamps.start || peak > stamps.end) throw new Error('Peak must be inside start/end.');
-  const previousId = selectedIndex >= 0 ? events[selectedIndex].event_id : null;
+  const previous = selectedIndex >= 0 ? events[selectedIndex] : null;
+  const previousId = previous ? previous.event_id : null;
   const id = previousId || `evt_${String(Date.now())}_${Math.floor(Math.random()*1000)}`;
   const technique = $('label').value, side = $('side').value, limb = $('effectorLimb').value;
   return {
@@ -222,9 +226,13 @@ function buildEvent() {
     review_status: $('reviewStatus').value,
     annotator: $('annotator').value.trim() || 'unknown',
     notes: $('notes').value.trim(),
+    technique_candidates: previous?.technique_candidates || [],
+    family_candidates: previous?.family_candidates || [],
+    field_confidence: previous?.field_confidence || {},
+    branch_evidence: previous?.branch_evidence || [],
     source: selectedIndex >= 0 && String(events[selectedIndex].source || '').includes('proposal') ? 'proposal_reviewed' : 'manual',
     annotation_revision: selectedIndex >= 0 ? Number(events[selectedIndex].annotation_revision || 0) + 1 : 1,
-    provenance: {source: selectedIndex >= 0 ? 'review_edit' : 'manual', imported_event_id: previousId}
+    provenance: {...(previous?.provenance || {}), source: selectedIndex >= 0 ? 'review_edit' : 'manual', imported_event_id: previousId}
   };
 }
 function saveEvent() {
@@ -250,11 +258,14 @@ function editEvent(index) {
   $('reviewStatus').value = e.review_status || 'proposed'; $('comboId').value = e.combo_id || '';
   $('counterTo').value = e.counter_to_event_id || ''; $('possibleCause').value = e.possible_cause || '';
   $('notes').value = e.notes || ''; $('save').textContent = 'A: update event';
+  const candidates = (e.technique_candidates || []).map(x => `${x.technique || x.label}: ${Number(x.confidence || 0).toFixed(3)}`).join(', ') || 'none';
+  const branches = (e.branch_evidence || []).map(x => `${x.branch}: ${x.technique || 'unknown'} (${Number(x.confidence || 0).toFixed(3)})`).join('\n') || 'none';
+  $('evidence').textContent = `Top techniques: ${candidates}\nBranch evidence:\n${branches}`;
   video.currentTime = Math.max(0, Number(e.start_sec)); render();
 }
 function render() {
   $('count').textContent = `${events.length} events`;
-  $('eventRows').innerHTML = events.map((e,i) => `<tr data-i="${i}" class="${i===selectedIndex?'selected':''}"><td>${i+1}</td><td>${formatTime(e.start_sec)}–${formatTime(e.end_sec)}</td><td>${e.actor_id ?? '—'}</td><td>${e.event_type || 'action'}</td><td>${e.label || '—'}</td><td>${e.review_status || '—'}</td></tr>`).join('');
+  $('eventRows').innerHTML = events.map((e,i) => { const top=(e.technique_candidates||[])[0]; const label=e.label && e.label!=='unknown_action' ? e.label : top ? `${top.technique || top.label}?` : (e.label || '—'); return `<tr data-i="${i}" class="${i===selectedIndex?'selected':''}"><td>${i+1}</td><td>${formatTime(e.start_sec)}–${formatTime(e.end_sec)}</td><td>${e.actor_id ?? '—'}</td><td>${e.event_type || 'action'}</td><td>${label}</td><td>${e.review_status || '—'}</td></tr>`; }).join('');
   document.querySelectorAll('#eventRows tr').forEach(row => row.onclick = () => editEvent(Number(row.dataset.i)));
 }
 function parseJsonl(text) {

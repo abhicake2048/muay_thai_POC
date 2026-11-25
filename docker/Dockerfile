@@ -63,6 +63,16 @@ RUN python -m pip check \
     && python -m pip freeze --all > /opt/mtdata/perception-environment.lock.txt
 CMD ["python", "mtdata.py", "doctor", "--profile", "perception"]
 
+FROM perception AS action
+COPY docker/requirements-action.txt /opt/mtdata/requirements-action.txt
+RUN python -m pip install \
+    -c /opt/mtdata/constraints.txt \
+    -r /opt/mtdata/requirements-action.txt
+RUN python -m pip check \
+    && python -m action_annotation_pipeline.dependency_check --profile action \
+    && python -m pip freeze --all > /opt/mtdata/action-environment.lock.txt
+CMD ["python", "mtdata.py", "doctor", "--profile", "action"]
+
 FROM perception AS full
 COPY docker/requirements-full.txt /opt/mtdata/requirements-full.txt
 RUN SAM2_BUILD_CUDA=0 python -m pip install \

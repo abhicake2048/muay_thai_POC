@@ -1,0 +1,9 @@
+# Local Qwen3-VL action discovery/classification. Keep this isolated from the
+# already validated perception image.
+transformers==4.57.6
+accelerate==1.10.1
+qwen-vl-utils==0.0.14
+av==16.0.1
+huggingface-hub==0.36.0
+tokenizers==0.22.1
+safetensors==0.6.2

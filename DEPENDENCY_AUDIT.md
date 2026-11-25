@@ -10,6 +10,7 @@ why the environment is split and how it is verified.
 |---|---|---|
 | base | Python 3.10, NumPy 1.26.4, PyTorch 2.7.1+cu128, TorchVision 0.22.1 | Shared CUDA runtime |
 | perception | OpenCV 4.11.0.86, Ultralytics 8.4.218, BoxMOT 16.0.11, MMCV 2.1.0, MMEngine 0.10.7, MMDetection 3.2.0, MMPose 1.3.2, xtcocotools 1.14.3, pycocotools 2.0.11 | YOLO, tracking and RTMPose |
+| action | perception plus Transformers 4.57.6, Accelerate 1.10.1, Qwen VL Utils 0.0.14 and PyAV 16.0.1 | Local Qwen3-VL action discovery without SAM2 |
 | full | perception plus Transformers 4.57.6, Accelerate 1.10.1, Qwen VL Utils 0.0.14, PyAV 16.0.1 and an immutable SAM2 commit | VideoMAE, Qwen3-VL and SAM2 |
 | annotation | OpenCV-headless 4.11.0.86 and FiftyOne 1.10.0 | Temporal review UI, isolated from perception |
 | RTMPose training | NumPy 1.26.4, PyTorch 2.1.0, TorchVision 0.16.0, OpenMMLab versions above | Existing Colab/local training workflow |
@@ -48,6 +49,7 @@ inside each image:
 
 ```text
 /opt/mtdata/perception-environment.lock.txt
+/opt/mtdata/action-environment.lock.txt
 /opt/mtdata/full-environment.lock.txt
 /opt/mtdata/annotation-environment.lock.txt
 ```
@@ -62,6 +64,10 @@ docker compose -f docker/compose.yaml --profile perception build --no-cache perc
 docker compose -f docker/compose.yaml --profile perception run --rm perception \
   python mtdata.py doctor --profile perception --require-gpu
 
+docker compose -f docker/compose.yaml --profile action build action
+docker compose -f docker/compose.yaml --profile action run --rm action \
+  python mtdata.py doctor --profile action --require-gpu
+
 docker compose -f docker/compose.yaml --profile full build full
 docker compose -f docker/compose.yaml --profile full run --rm full \
   python mtdata.py doctor --profile full --require-gpu
@@ -70,6 +76,10 @@ docker compose -f docker/compose.yaml --profile annotation build annotation
 docker compose -f docker/compose.yaml --profile annotation run --rm annotation \
   python mtdata.py doctor --profile annotation
 ```
+
+`docker/Dockerfile.action` starts from the tagged local perception image. This
+keeps YOLO/RTMPose unchanged and prevents ordinary source updates from
+rebuilding the expensive MMCV/MMPose layers.
 
 The first perception build compiles MMCV and can take several minutes.  Use
 `MMCV_MAX_JOBS=1` (the default) on memory-constrained systems.

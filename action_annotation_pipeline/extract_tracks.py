@@ -3,17 +3,19 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import sys
 from collections import defaultdict
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 import cv2
 import numpy as np
 
-from common import PipelineError, load_manifest, write_json, write_jsonl
+from common import PipelineError, load_manifest, read_json, write_json, write_jsonl
 
 
 COLORS = [(52, 211, 153), (251, 146, 60), (96, 165, 250), (244, 114, 182)]
@@ -107,6 +109,30 @@ def parse_args() -> argparse.Namespace:
 
 def color_for(track_id: int) -> tuple[int, int, int]:
     return COLORS[abs(int(track_id)) % len(COLORS)]
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _was_automatic_map(existing: dict[str, Any], previous_suggested: dict[str, Any] | None) -> bool:
+    """Return True only when replacing the canonical map is demonstrably safe."""
+    status = str(existing.get("review_status", "")).lower()
+    if status in {"suggested", "automatic"}:
+        return True
+    if status in {"verified", "manual", "reviewed"}:
+        return False
+    # Legacy projects wrote the same payload to both files.  Comparing only the
+    # fighter list tolerates newly added provenance fields while still
+    # preserving a map that a reviewer actually edited.
+    return bool(
+        previous_suggested
+        and existing.get("fighters") == previous_suggested.get("fighters")
+    )
 
 
 def main() -> int:
@@ -244,7 +270,14 @@ def main() -> int:
         write_json(project / "tracks" / "track_summary.json", {"tracks": ranked})
         chosen = ranked[: int(manifest.get("expected_fighters", 2))]
         fighter_map = {
-            "schema_version": "1.0",
+            "schema_version": "2.0",
+            "review_status": "suggested",
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "processed_start_sec": 0.0,
+            "processed_end_sec": float(records[-1]["timestamp"]),
+            "proxy_duration_sec": float(manifest["proxy_video"]["duration_sec"]),
+            "source_tracks": str(tracks_path),
+            "source_tracks_sha256": _sha256(tracks_path),
             "instructions": "Verify these suggested raw track IDs in tracks_overlay.mp4. If an ID switches, split track_segments at the switch time.",
             "fighters": [
                 {
@@ -256,11 +289,20 @@ def main() -> int:
             ],
         }
         suggested_path = project / "tracks" / "fighter_map.suggested.json"
+        previous_suggested = read_json(suggested_path) if suggested_path.is_file() else None
         write_json(suggested_path, fighter_map)
         final_map = project / "tracks" / "fighter_map.json"
+        map_action = "created"
         if not final_map.exists():
             write_json(final_map, fighter_map)
-        print(json.dumps({"frames": len(records), "tracks": len(ranked), "suggested_fighters": chosen, "tracks_file": str(tracks_path), "overlay": str(overlay_path), "fighter_map": str(final_map)}, indent=2))
+        else:
+            existing = read_json(final_map)
+            if _was_automatic_map(existing, previous_suggested):
+                write_json(final_map, fighter_map)
+                map_action = "refreshed_automatic"
+            else:
+                map_action = "preserved_reviewed_or_modified"
+        print(json.dumps({"frames": len(records), "tracks": len(ranked), "suggested_fighters": chosen, "tracks_file": str(tracks_path), "overlay": str(overlay_path), "fighter_map": str(final_map), "fighter_map_action": map_action}, indent=2))
         return 0
     except (ImportError, OSError, ValueError, PipelineError) as exc:
         print(f"Error: {exc}", file=sys.stderr)

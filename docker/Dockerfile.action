@@ -1,0 +1,20 @@
+# Add local Qwen3-VL action discovery to the already validated perception
+# image. Keeping this separate prevents source changes from invalidating the
+# expensive MMCV/MMPose build layers.
+ARG PERCEPTION_IMAGE=muay-thai-data-factory-perception:latest
+FROM ${PERCEPTION_IMAGE}
+
+COPY docker/constraints.txt /opt/mtdata/constraints.txt
+COPY docker/requirements-action.txt /opt/mtdata/requirements-action.txt
+RUN python -m pip install \
+    -c /opt/mtdata/constraints.txt \
+    -r /opt/mtdata/requirements-action.txt
+
+COPY pyproject.toml mtdata.py /opt/mtdata/
+COPY action_annotation_pipeline /opt/mtdata/action_annotation_pipeline
+RUN python -m pip install --no-deps --no-build-isolation -e /opt/mtdata \
+    && python -m pip check \
+    && python -m action_annotation_pipeline.dependency_check --profile action \
+    && python -m pip freeze --all > /opt/mtdata/action-environment.lock.txt
+
+CMD ["python", "mtdata.py", "doctor", "--profile", "action"]

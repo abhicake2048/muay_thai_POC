@@ -22,10 +22,21 @@ services:
   perception:
     <<: *common
     profiles: [perception]
+    image: muay-thai-data-factory-perception:latest
     build:
       context: ..
       dockerfile: docker/Dockerfile
       target: perception
+
+  action:
+    <<: *common
+    profiles: [action]
+    image: muay-thai-data-factory-action:latest
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.action
+      args:
+        PERCEPTION_IMAGE: muay-thai-data-factory-perception:latest
 
   full:
     <<: *common

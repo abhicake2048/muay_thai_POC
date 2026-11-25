@@ -132,6 +132,122 @@ def command_ingest(args: argparse.Namespace) -> int:
     return 0
 
 
+def _run_action_stages(
+    project: Path,
+    *,
+    mode: str,
+    device: str,
+    vlm_model: Path | None,
+    vlm_limit: int,
+    scan_mode: str,
+    window_seconds: float,
+    hop_seconds: float,
+    model_branches: list[Path] | None,
+    overwrite: bool,
+) -> Path:
+    manifest = read_json(project / "manifest.json")
+    proxy = Path(manifest["paths"]["proxy_video"])
+    tracks = project / "tracks" / "tracks.jsonl"
+    fighter_map = project / "tracks" / "fighter_map.json"
+    poses = project / "poses" / "poses.npz"
+    actionness = project / "proposals" / "branches" / "pose_actionness.jsonl"
+    actionness_report = project / "qa" / "pose_actionness_report.json"
+    _stage(
+        project,
+        "pose_actionness",
+        "propose_actions.py",
+        ["--project", str(project)],
+        [poses, fighter_map],
+        [actionness, actionness_report],
+        overwrite,
+    )
+    attributes = project / "proposals" / "branches" / "pose_attributes.jsonl"
+    _stage(
+        project,
+        "pose_attributes",
+        "infer_attributes.py",
+        ["--project", str(project), "--input", str(actionness)],
+        [poses, actionness, fighter_map],
+        [attributes],
+        overwrite,
+    )
+    branches = [actionness, attributes]
+    if mode == "hybrid":
+        if vlm_model is None:
+            raise PipelineError("hybrid action mode requires --vlm-model")
+        model_path = vlm_model.expanduser().resolve()
+        qwen = project / "proposals" / "branches" / "qwen_actions.jsonl"
+        qwen_summary = project / "proposals" / "raw" / "qwen" / "summary.json"
+        vlm_args = [
+            "--project", str(project), "--model", str(model_path), "--device", device,
+            "--input", str(attributes), "--scan-mode", scan_mode,
+            "--window-seconds", str(window_seconds), "--hop-seconds", str(hop_seconds),
+        ]
+        if vlm_limit:
+            vlm_args.extend(["--limit", str(vlm_limit)])
+        _stage(
+            project,
+            "qwen_actions",
+            "vlm_qwen.py",
+            vlm_args,
+            [proxy, tracks, fighter_map, attributes, model_path],
+            [qwen, qwen_summary],
+            overwrite,
+        )
+        branches.append(qwen)
+    for branch in model_branches or []:
+        branch_path = branch.expanduser().resolve()
+        if not branch_path.is_file():
+            raise PipelineError(f"Model proposal branch not found: {branch_path}")
+        branches.append(branch_path)
+    fused = project / "proposals" / "fused_proposals.jsonl"
+    _stage(
+        project,
+        "proposal_fusion",
+        "fuse_proposals.py",
+        ["--project", str(project), "--branches", *[str(path) for path in branches]],
+        branches,
+        [fused],
+        overwrite,
+    )
+    diagnostics = project / "qa" / "action_diagnostics.json"
+    timeline = project / "qa" / "action_timeline.html"
+    _stage(
+        project,
+        "action_diagnostics",
+        "action_diagnostics.py",
+        ["--project", str(project)],
+        [tracks, poses, fighter_map, fused, *branches],
+        [diagnostics, timeline],
+        overwrite,
+    )
+    return fused
+
+
+def command_actions(args: argparse.Namespace) -> int:
+    project = args.project.expanduser().resolve()
+    fused = _run_action_stages(
+        project,
+        mode=args.mode,
+        device=args.device,
+        vlm_model=args.vlm_model,
+        vlm_limit=args.vlm_limit,
+        scan_mode=args.scan_mode,
+        window_seconds=args.window_seconds,
+        hop_seconds=args.hop_seconds,
+        model_branches=args.model_branch,
+        overwrite=args.overwrite,
+    )
+    print(json.dumps({"project": str(project), "mode": args.mode, "fused_proposals": str(fused), "diagnostics": str(project / 'qa' / 'action_diagnostics.json'), "human_review_required": True}, indent=2))
+    return 0
+
+
+def command_diagnose_actions(args: argparse.Namespace) -> int:
+    project = args.project.expanduser().resolve()
+    _run([sys.executable, str(_script("action_diagnostics.py")), "--project", str(project)], project / "logs" / "action_diagnostics.log")
+    return 0
+
+
 def command_infer(args: argparse.Namespace) -> int:
     project = args.project.expanduser().resolve()
     manifest = read_json(project / "manifest.json")
@@ -152,21 +268,20 @@ def command_infer(args: argparse.Namespace) -> int:
         teacher_output = project / "poses" / "teachers" / f"{safe_name}.npz"
         teacher_args = [*common, *frame_args, "--config", str(Path(teacher_config).expanduser().resolve()), "--checkpoint", str(Path(teacher_checkpoint).expanduser().resolve()), "--output", str(teacher_output), "--overlay", str(project / "qa" / f"poses_{safe_name}_overlay.mp4"), "--metadata", str(project / "poses" / "teachers" / f"{safe_name}_metadata.json")]
         _stage(project, f"pose_teacher_{safe_name}", "extract_poses.py", teacher_args, [proxy, tracks, Path(teacher_config).expanduser().resolve(), Path(teacher_checkpoint).expanduser().resolve()], [teacher_output], args.overwrite)
-    motion = project / "proposals" / "branches" / "pose_motion.jsonl"
-    _stage(project, "pose_motion", "propose_actions.py", ["--project", str(project)], [poses, fighter_map], [motion], args.overwrite)
-    attributes = project / "proposals" / "branches" / "pose_attributes.jsonl"
-    _stage(project, "pose_attributes", "infer_attributes.py", ["--project", str(project)], [poses, motion, fighter_map], [attributes], args.overwrite)
-    branches = [motion, attributes]
-    if args.profile == "full" and args.vlm_model:
-        qwen = project / "proposals" / "branches" / "qwen3_vl.jsonl"
-        vlm_args = ["--project", str(project), "--model", str(args.vlm_model.expanduser().resolve()), "--device", args.device]
-        if args.vlm_limit:
-            vlm_args.extend(["--limit", str(args.vlm_limit)])
-        _stage(project, "qwen3_vl", "vlm_qwen.py", vlm_args, [proxy, attributes, args.vlm_model.expanduser().resolve()], [qwen], args.overwrite)
-        branches.append(qwen)
-    fused = project / "proposals" / "fused_proposals.jsonl"
-    _stage(project, "proposal_fusion", "fuse_proposals.py", ["--project", str(project), "--branches", *[str(path) for path in branches]], branches, [fused], args.overwrite)
-    print(json.dumps({"project": str(project), "profile": args.profile, "fused_proposals": str(fused), "human_review_required": True}, indent=2))
+    action_mode = "hybrid" if args.profile == "full" and args.vlm_model else "pose"
+    fused = _run_action_stages(
+        project,
+        mode=action_mode,
+        device=args.device,
+        vlm_model=args.vlm_model,
+        vlm_limit=args.vlm_limit,
+        scan_mode="hybrid",
+        window_seconds=3.0,
+        hop_seconds=1.5,
+        model_branches=None,
+        overwrite=args.overwrite,
+    )
+    print(json.dumps({"project": str(project), "profile": args.profile, "action_mode": action_mode, "fused_proposals": str(fused), "human_review_required": True}, indent=2))
     return 0
 
 
@@ -329,6 +444,23 @@ def build_parser() -> argparse.ArgumentParser:
     infer.add_argument("--overwrite", action="store_true")
     infer.set_defaults(func=command_infer)
 
+    actions = subparsers.add_parser("actions", help="Run only action proposal, classification, fusion and diagnostics stages")
+    actions.add_argument("project", type=Path)
+    actions.add_argument("--mode", choices=("pose", "hybrid"), default="pose")
+    actions.add_argument("--device", default="cuda:0")
+    actions.add_argument("--vlm-model", type=Path)
+    actions.add_argument("--vlm-limit", type=int, default=0)
+    actions.add_argument("--scan-mode", choices=("candidates", "hybrid", "dense"), default="hybrid")
+    actions.add_argument("--window-seconds", type=float, default=3.0)
+    actions.add_argument("--hop-seconds", type=float, default=1.5)
+    actions.add_argument("--model-branch", type=Path, action="append", help="Optional PoseC3D, Boxing6 or TriDet proposal JSONL; repeatable")
+    actions.add_argument("--overwrite", action="store_true")
+    actions.set_defaults(func=command_actions)
+
+    diagnose_actions = subparsers.add_parser("diagnose-actions", help="Report action-pipeline temporal coverage and classifier health")
+    diagnose_actions.add_argument("project", type=Path)
+    diagnose_actions.set_defaults(func=command_diagnose_actions)
+
     review = subparsers.add_parser("review", help="Prepare or launch the FiftyOne review dataset")
     review.add_argument("project", type=Path)
     review.add_argument("--launch", action="store_true")
@@ -377,7 +509,7 @@ def build_parser() -> argparse.ArgumentParser:
     doctor = subparsers.add_parser("doctor", help="Check local/GPU/optional dependencies")
     doctor.add_argument(
         "--profile",
-        choices=("auto", "base", "perception", "full", "annotation", "rtmpose-training"),
+        choices=("auto", "base", "perception", "action", "full", "annotation", "rtmpose-training"),
         default="auto",
     )
     doctor.add_argument("--require-gpu", action="store_true")

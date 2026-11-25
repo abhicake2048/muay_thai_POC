@@ -59,6 +59,18 @@ python mtdata.py infer generated/action_annotations_v2/sparring_1 --device cuda:
 python mtdata.py status generated/action_annotations_v2/sparring_1
 ```
 
+Core inference deliberately proposes high-recall pose-actionness intervals and
+coarse limb/family evidence. Exact techniques require a learned branch. Diagnose
+coverage and classifier health with:
+
+```powershell
+python mtdata.py diagnose-actions generated/action_annotations_v2/sparring_1
+```
+
+After a short `--max-frames` smoke test, a later full tracking run refreshes an
+automatic fighter map to the full duration. A verified or manually edited map
+is preserved and must be extended by its reviewer when incomplete.
+
 For a pilot tracker bakeoff, export candidate JSONL files from BoT-SORT,
 DeepOCSORT/OccluBoost and the simple baseline, review a short gold JSONL, then
 run:
@@ -106,11 +118,27 @@ docker compose -f docker/compose.yaml run --rm perception \
   python mtdata.py infer generated/action_annotations_v2/sparring_1 --device cuda:0
 ```
 
-The full target adds FiftyOne, Transformers/Qwen, BoxMOT, and SAM2 dependencies:
+The full target adds Transformers/Qwen and SAM2 dependencies. FiftyOne remains
+isolated in the annotation target:
 
 ```bash
 docker compose -f docker/compose.yaml build full
 ```
+
+For action discovery without SAM2, use the smaller isolated action target:
+
+```bash
+docker compose -f docker/compose.yaml --profile action build action
+docker compose -f docker/compose.yaml --profile action run --rm action \
+  python mtdata.py doctor --profile action --require-gpu
+```
+
+The Compose action image is layered from the already-built
+`muay-thai-data-factory-perception:latest` image through
+`docker/Dockerfile.action`. It installs only the Qwen/Transformers additions
+and current application code, so it does not rebuild MMCV, MMPose, YOLO, or
+PyTorch. Build the perception service once first if that local image is not
+present. Do not add `--pull` when building this local derivative image.
 
 Large model weights remain mounted under `models/` and are not downloaded by
 pipeline code.
@@ -126,9 +154,22 @@ python mtdata.py infer generated/action_annotations_v2/sparring_1 `
   --profile full --vlm-model models/Qwen3-VL-8B-Instruct --device cuda:0
 ```
 
-The VLM sees approximately three seconds around each pose-motion peak sampled
-near 8 FPS. Its structured JSON remains a proposal branch. Fusion retains raw
-evidence from every branch.
+The VLM sees three-second actor-centric composite clips at 6 FPS. Hybrid mode
+classifies every pose-actionness candidate and scans uncovered time at a
+1.5-second hop. It can return zero or multiple actions per window. Structured
+JSON, raw responses, parse failures, and per-branch evidence are retained.
+
+Run only the action stages, reusing existing tracks and poses:
+
+```powershell
+python mtdata.py actions generated/action_annotations_v2/sparring_1 `
+  --mode hybrid --scan-mode hybrid `
+  --vlm-model models/Qwen3-VL-8B-Instruct --device cuda:0
+```
+
+Optional Boxing6/PoseC3D/TriDet adapters can supply canonical proposal JSONL
+through repeatable `--model-branch PATH` arguments. Model predictions never
+become ground truth without review.
 
 ## Review with FiftyOne and CVAT
 

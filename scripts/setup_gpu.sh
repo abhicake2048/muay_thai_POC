@@ -2,8 +2,8 @@
 set -Eeuo pipefail
 
 PROFILE="${1:-perception}"
-if [[ "$PROFILE" != "perception" && "$PROFILE" != "full" && "$PROFILE" != "annotation" ]]; then
-  echo "Usage: bash scripts/setup_gpu.sh [perception|full|annotation]" >&2
+if [[ "$PROFILE" != "perception" && "$PROFILE" != "action" && "$PROFILE" != "full" && "$PROFILE" != "annotation" ]]; then
+  echo "Usage: bash scripts/setup_gpu.sh [perception|action|full|annotation]" >&2
   exit 2
 fi
 
@@ -81,6 +81,12 @@ else
   python -m pip install \
     -c "$PROJECT_ROOT/docker/constraints.txt" \
     -r "$PROJECT_ROOT/docker/requirements-perception.txt"
+fi
+
+if [[ "$PROFILE" == "action" ]]; then
+  python -m pip install \
+    -c "$PROJECT_ROOT/docker/constraints.txt" \
+    -r "$PROJECT_ROOT/docker/requirements-action.txt"
 fi
 
 if [[ "$PROFILE" == "full" ]]; then

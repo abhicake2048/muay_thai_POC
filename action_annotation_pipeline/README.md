@@ -13,8 +13,22 @@ Quick start from the repository root:
 python mtdata.py doctor
 python mtdata.py ingest datasets/videos/sparring_1.mp4
 python mtdata.py infer generated/action_annotations_v2/sparring_1 --device cuda:0
+python mtdata.py diagnose-actions generated/action_annotations_v2/sparring_1
 python mtdata.py review generated/action_annotations_v2/sparring_1
 ```
+
+`infer` always creates high-recall pose-actionness windows. It does not invent
+fine-grained techniques. Run the action-only hybrid stage in the local Qwen
+image to classify candidates and scan uncovered time without repeating YOLO or
+RTMPose:
+
+```powershell
+python mtdata.py actions generated/action_annotations_v2/sparring_1 `
+  --mode hybrid --vlm-model models/Qwen3-VL-8B-Instruct --device cuda:0
+```
+
+Inspect `qa/action_diagnostics.json` and `qa/action_timeline.html`. Automatic
+labels remain proposals until a person verifies them.
 
 Open the generated `review/annotate.html` for the dependency-free reviewer, or
 install FiftyOne and add `--launch`. After exporting reviewed JSONL:

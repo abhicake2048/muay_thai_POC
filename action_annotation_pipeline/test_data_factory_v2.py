@@ -13,11 +13,16 @@ sys.path.insert(0, str(PIPELINE_ROOT))
 
 from aggregate_dataset import freeze  # noqa: E402
 from common import read_json, write_json, write_jsonl  # noqa: E402
+from action_signals import fighter_map_coverage  # noqa: E402
+from extract_tracks import _was_automatic_map  # noqa: E402
 from fuse_proposals import fuse  # noqa: E402
 from schema import canonicalize_event, display_label  # noqa: E402
 from state import StageState, stage_signature  # noqa: E402
 from validate_events import validate  # noqa: E402
 from benchmark_trackers import score_tracker  # noqa: E402
+from vlm_qwen import _json_object, build_scan_tasks, normalize_events  # noqa: E402
+
+import numpy as np
 
 
 class DataFactoryV2Tests(unittest.TestCase):
@@ -53,6 +58,89 @@ class DataFactoryV2Tests(unittest.TestCase):
         self.assertEqual(output[0]["technique"], "hook")
         self.assertEqual(output[0]["effector_id"], "left_hand")
         self.assertEqual(len(output[0]["branch_evidence"]), 2)
+
+    def test_stale_smoke_map_does_not_cover_full_pose_timeline(self) -> None:
+        mapping = {"fighters": [
+            {"fighter_id": 0, "track_segments": [{"track_id": 10, "start_sec": 0, "end_sec": 4}]},
+            {"fighter_id": 1, "track_segments": [{"track_id": 11, "start_sec": 0, "end_sec": 4}]},
+        ]}
+        report = fighter_map_coverage(
+            mapping,
+            np.asarray([0.0, 0.0, 3.9, 3.9, 10.0, 10.0]),
+            np.asarray([10, 11, 10, 11, 10, 11]),
+            2,
+        )
+        self.assertFalse(report["complete"])
+        self.assertEqual(report["unmapped_pose_instances"], 2)
+
+    def test_only_automatic_fighter_maps_are_replaced(self) -> None:
+        previous = {"fighters": [{"fighter_id": 0, "track_segments": [{"track_id": 1, "start_sec": 0, "end_sec": 4}]}]}
+        self.assertTrue(_was_automatic_map(dict(previous), previous))
+        self.assertTrue(_was_automatic_map({**previous, "review_status": "suggested"}, None))
+        self.assertFalse(_was_automatic_map({**previous, "review_status": "verified"}, previous))
+        modified = {"fighters": [{"fighter_id": 0, "track_segments": [{"track_id": 9, "start_sec": 0, "end_sec": 4}]}]}
+        self.assertFalse(_was_automatic_map(modified, previous))
+
+    def test_dense_vlm_scan_exists_without_pose_candidates(self) -> None:
+        tasks = build_scan_tasks([], 6.0, 2, 3.0, 1.5, "hybrid")
+        self.assertGreaterEqual(len(tasks), 4)
+        self.assertEqual({task["actor_id"] for task in tasks}, {0, 1})
+        self.assertTrue(all(task["kind"] == "dense" for task in tasks))
+
+    def test_vlm_window_can_return_multiple_actions(self) -> None:
+        payload = {"events": [
+            {"start_offset_sec": 0.2, "peak_offset_sec": 0.4, "end_offset_sec": 0.7, "technique": "jab", "confidence": 0.8, "anatomical_side": "left", "effector_limb": "hand"},
+            {"start_offset_sec": 0.8, "peak_offset_sec": 1.0, "end_offset_sec": 1.3, "technique": "cross", "confidence": 0.75, "anatomical_side": "right", "effector_limb": "hand"},
+        ]}
+        task = {"task_id": "dense_1", "kind": "dense", "actor_id": 0, "start_sec": 10.0, "end_sec": 13.0, "source": None}
+        events = normalize_events(payload, task, {"video_id": "test"}, self.schema)
+        self.assertEqual(len(events), 2)
+        self.assertEqual([event["technique"] for event in events], ["jab", "cross"])
+        self.assertEqual(events[1]["peak_sec"], 11.0)
+
+    def test_vlm_zero_event_and_malformed_json_handling(self) -> None:
+        task = {"task_id": "dense_1", "kind": "dense", "actor_id": 0, "start_sec": 0.0, "end_sec": 3.0, "source": None}
+        self.assertEqual(normalize_events({"events": []}, task, {"video_id": "test"}, self.schema), [])
+        with self.assertRaises(ValueError):
+            _json_object("not JSON")
+        with self.assertRaises(ValueError):
+            _json_object('{"events":"jab"}')
+
+    def test_conflicting_low_confidence_side_stays_unknown(self) -> None:
+        base = {"actor_id": 0, "target_id": 1, "start_sec": 1.0, "peak_sec": 1.3, "end_sec": 1.6, "event_type": "action", "review_status": "proposed", "effector_limb": "hand"}
+        rows = [
+            {**base, "event_id": "pose", "technique": "unknown_action", "anatomical_side": "left", "proposal_branch": "pose_attributes", "proposal_confidence": 0.7, "attribute_confidence": 0.6},
+            {**base, "event_id": "qwen", "technique": "jab", "anatomical_side": "right", "proposal_branch": "qwen_actions", "proposal_confidence": 0.7, "attribute_confidence": 0.7},
+        ]
+        output = fuse(rows, self.schema)
+        self.assertEqual(output[0]["anatomical_side"], "unknown")
+
+    def test_vlm_technique_must_match_pose_family(self) -> None:
+        base = {"actor_id": 0, "target_id": 1, "start_sec": 1.0, "peak_sec": 1.3, "end_sec": 1.6, "event_type": "action", "review_status": "proposed", "anatomical_side": "left"}
+        rows = [
+            {**base, "event_id": "pose", "technique": "unknown_action", "effector_limb": "hand", "family_candidates": [{"label": "punch", "confidence": 0.8}], "proposal_branch": "pose_actionness", "proposal_confidence": 0.8},
+            {**base, "event_id": "qwen", "technique": "roundhouse_kick", "effector_limb": "hand", "proposal_branch": "qwen_actions", "proposal_confidence": 0.95},
+        ]
+        output = fuse(rows, self.schema)
+        self.assertEqual(output[0]["technique"], "unknown_action")
+        self.assertEqual(output[0]["technique_candidates"][0]["technique"], "roundhouse_kick")
+
+    def test_fusion_preserves_nearby_visual_combination(self) -> None:
+        base = {"actor_id": 0, "target_id": 1, "start_sec": 1.0, "end_sec": 2.0, "event_type": "action", "review_status": "proposed", "anatomical_side": "left", "effector_limb": "hand", "proposal_branch": "qwen_actions", "proposal_confidence": 0.9}
+        rows = [
+            {**base, "event_id": "jab1", "peak_sec": 1.20, "technique": "jab"},
+            {**base, "event_id": "jab2", "peak_sec": 1.45, "technique": "jab"},
+        ]
+        output = fuse(rows, self.schema)
+        self.assertEqual(len(output), 2)
+
+    def test_fusion_preserves_different_pose_effectors_at_same_time(self) -> None:
+        base = {"actor_id": 0, "target_id": 1, "start_sec": 1.0, "peak_sec": 1.3, "end_sec": 1.6, "event_type": "action", "review_status": "proposed", "technique": "unknown_action", "proposal_branch": "pose_actionness", "proposal_confidence": 0.8}
+        rows = [
+            {**base, "event_id": "left", "pose_effector_id": "left_hand", "anatomical_side": "left", "effector_limb": "hand"},
+            {**base, "event_id": "right", "pose_effector_id": "right_hand", "anatomical_side": "right", "effector_limb": "hand"},
+        ]
+        self.assertEqual(len(fuse(rows, self.schema)), 2)
 
     def test_stage_state_only_accepts_current_outputs(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

@@ -41,7 +41,7 @@ PERCEPTION_VERSIONS = {
     "regex": "2024.11.6",
 }
 
-FULL_VERSIONS = {
+ACTION_VERSIONS = {
     **PERCEPTION_VERSIONS,
     "transformers": "4.57.6",
     "accelerate": "1.10.1",
@@ -50,6 +50,10 @@ FULL_VERSIONS = {
     "huggingface-hub": "0.36.0",
     "tokenizers": "0.22.1",
     "safetensors": "0.6.2",
+}
+
+FULL_VERSIONS = {
+    **ACTION_VERSIONS,
     "SAM-2": "1.0",
 }
 
@@ -87,6 +91,7 @@ RTMPOSE_TRAINING_VERSIONS = {
 EXPECTED = {
     "base": BASE_VERSIONS,
     "perception": PERCEPTION_VERSIONS,
+    "action": ACTION_VERSIONS,
     "full": FULL_VERSIONS,
     "annotation": ANNOTATION_VERSIONS,
     "rtmpose-training": RTMPOSE_TRAINING_VERSIONS,
@@ -117,6 +122,8 @@ def detect_profile() -> str:
         return "annotation"
     if _version("SAM-2") and _version("transformers"):
         return "full"
+    if _version("transformers") and _version("mmpose"):
+        return "action"
     if _version("mmpose"):
         return "perception"
     return "base"
@@ -159,7 +166,7 @@ def audit_environment(profile: str = "auto", require_gpu: bool = False) -> dict[
                 f"{required_opencv}, found {opencv_installed or 'none'}"
             )
 
-    if profile in {"perception", "full", "rtmpose-training"}:
+    if profile in {"perception", "action", "full", "rtmpose-training"}:
         mmcv_variants = [name for name in ("mmcv", "mmcv-lite") if _version(name)]
         if mmcv_variants != ["mmcv"]:
             errors.append(
@@ -204,7 +211,7 @@ def audit_environment(profile: str = "auto", require_gpu: bool = False) -> dict[
         errors.append(f"NumPy ABI mismatch: imported {numpy_module.__version__}")
 
     imported: list[str] = []
-    if profile in {"perception", "full", "rtmpose-training"}:
+    if profile in {"perception", "action", "full", "rtmpose-training"}:
         perception_modules = [
             "cv2",
             "ultralytics",
@@ -232,7 +239,7 @@ def audit_environment(profile: str = "auto", require_gpu: bool = False) -> dict[
                 f"{type(exc).__name__}: {exc}"
             )
 
-    if profile == "full":
+    if profile in {"action", "full"}:
         for module_name in ("accelerate", "qwen_vl_utils", "av"):
             if _import(module_name, errors) is not None:
                 imported.append(module_name)
@@ -243,13 +250,18 @@ def audit_environment(profile: str = "auto", require_gpu: bool = False) -> dict[
                 AutoModelForImageTextToText,
                 AutoProcessor,
             )
-            from sam2.build_sam import build_sam2_video_predictor  # noqa: F401
-
-            imported.extend(("transformers auto APIs", "sam2.build_sam"))
+            imported.append("transformers auto APIs")
         except Exception as exc:
             errors.append(
-                f"required full-profile API import failed: {type(exc).__name__}: {exc}"
+                f"required action-profile API import failed: {type(exc).__name__}: {exc}"
             )
+        if profile == "full":
+            try:
+                from sam2.build_sam import build_sam2_video_predictor  # noqa: F401
+
+                imported.append("sam2.build_sam")
+            except Exception as exc:
+                errors.append(f"required full-profile SAM2 import failed: {type(exc).__name__}: {exc}")
 
     if profile == "annotation":
         _import("cv2", errors)
@@ -281,6 +293,7 @@ def main() -> int:
             "auto",
             "base",
             "perception",
+            "action",
             "full",
             "annotation",
             "rtmpose-training",
