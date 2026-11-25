@@ -41,7 +41,7 @@ RUN python -m pip install \
     --no-build-isolation "chumpy==0.70"
 RUN python -m pip install -r /opt/mtdata/requirements-perception.txt
 RUN python -m pip check && python -c \
-    "import cv2, mmcv, mmengine, numpy, torch, ultralytics, xtcocotools._mask; from mmpose.apis import inference_topdown, init_model; import mmpose; assert numpy.__version__ == '1.26.4', numpy.__version__; print('RTMPose imports OK'); print('numpy', numpy.__version__, 'opencv', cv2.__version__); print('torch', torch.__version__, 'CUDA wheel', torch.version.cuda); print('mmcv', mmcv.__version__, 'mmpose', mmpose.__version__)"
+    "import cv2, mmcv, mmdet, mmengine, numpy, torch, ultralytics, xtcocotools._mask; from mmpose.apis import inference_topdown, init_model; import mmpose; assert numpy.__version__ == '1.26.4', numpy.__version__; print('RTMPose imports OK'); print('numpy', numpy.__version__, 'opencv', cv2.__version__); print('torch', torch.__version__, 'CUDA wheel', torch.version.cuda); print('mmcv', mmcv.__version__, 'mmdet', mmdet.__version__, 'mmpose', mmpose.__version__)"
 
 FROM perception AS full
 COPY docker/requirements-full.txt /opt/mtdata/requirements-full.txt
