@@ -6,8 +6,12 @@ ENV DEBIAN_FRONTEND=noninteractive \
     NO_ALBUMENTATIONS_UPDATE=1
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3 python3-pip python3-venv git ffmpeg libgl1 libglib2.0-0 build-essential ninja-build \
+    python3 python3-dev python3-pip python3-setuptools python3-venv python3-wheel \
+    git ffmpeg libgl1 libglib2.0-0 build-essential ninja-build pkg-config \
     && rm -rf /var/lib/apt/lists/*
+
+RUN python3 -m pip install --break-system-packages --upgrade \
+    pip "setuptools<81" wheel "Cython>=0.29.36,<3" "numpy>=1.26,<2"
 
 RUN python3 -m pip install --break-system-packages \
     torch torchvision --index-url https://download.pytorch.org/whl/cu128
@@ -19,8 +23,11 @@ RUN python3 -m pip install --break-system-packages -e /opt/mtdata
 
 FROM base AS perception
 COPY docker/requirements-perception.txt /opt/mtdata/requirements-perception.txt
+RUN python3 -m pip install --break-system-packages --no-build-isolation \
+    "xtcocotools==1.14.3"
 RUN python3 -m pip install --break-system-packages -r /opt/mtdata/requirements-perception.txt
-RUN mim install "mmcv>=2.0.1"
+RUN python3 -m pip check && python3 -c \
+    "import cv2, mmcv, mmengine, mmpose, torch, ultralytics, xtcocotools; print('perception imports OK'); print('torch', torch.__version__, 'CUDA wheel', torch.version.cuda); print('mmcv', mmcv.__version__, 'mmpose', mmpose.__version__)"
 
 FROM perception AS full
 COPY docker/requirements-full.txt /opt/mtdata/requirements-full.txt
