@@ -6,8 +6,9 @@ import argparse
 import json
 import os
 import sys
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 import cv2
 import numpy as np
@@ -20,6 +21,31 @@ os.environ.setdefault("NO_ALBUMENTATIONS_UPDATE", "1")
 
 COCO_LINKS = [(5, 7), (7, 9), (6, 8), (8, 10), (5, 6), (5, 11), (6, 12), (11, 12), (11, 13), (13, 15), (12, 14), (14, 16)]
 COLORS = [(52, 211, 153), (251, 146, 60), (96, 165, 250), (244, 114, 182)]
+
+
+@contextmanager
+def trusted_checkpoint_loading() -> Iterator[None]:
+    """Let legacy MMEngine load a trusted checkpoint under PyTorch 2.6+.
+
+    PyTorch 2.6 changed ``torch.load`` to default to ``weights_only=True``.
+    MMEngine 0.10.7 does not pass that argument when loading a local file, and
+    older MMPose checkpoints commonly contain NumPy metadata that the restricted
+    unpickler rejects.  PyTorch documents this environment variable for legacy
+    call sites that cannot pass ``weights_only=False`` themselves.
+
+    Unrestricted pickle loading can execute code, so keep the override scoped
+    to model initialization and use only checkpoints from a trusted source.
+    """
+    variable = "TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD"
+    previous = os.environ.get(variable)
+    os.environ[variable] = "1"
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop(variable, None)
+        else:
+            os.environ[variable] = previous
 
 
 def parse_args() -> argparse.Namespace:
@@ -84,7 +110,9 @@ def main() -> int:
             device = "cuda:0" if torch.cuda.is_available() else "cpu"
         if str(device).startswith("cuda") and not torch.cuda.is_available():
             raise PipelineError("CUDA requested but unavailable")
-        model = init_model(str(config), str(checkpoint), device=device)
+        print(f"Loading trusted RTMPose checkpoint: {checkpoint}", flush=True)
+        with trusted_checkpoint_loading():
+            model = init_model(str(config), str(checkpoint), device=device)
 
         output_path.parent.mkdir(parents=True, exist_ok=True)
         overlay_path.parent.mkdir(parents=True, exist_ok=True)
