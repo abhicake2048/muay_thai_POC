@@ -30,6 +30,13 @@ python mtdata.py actions generated/action_annotations_v2/sparring_1 `
 Inspect `qa/action_diagnostics.json` and `qa/action_timeline.html`. Automatic
 labels remain proposals until a person verifies them.
 
+`--mode pose` intentionally produces motion candidates only; it cannot name a
+jab, kick, elbow, or defense. `--mode hybrid` runs the Qwen technique branch.
+Hybrid output is split into `proposals/classified_actions.jsonl` and
+`proposals/unresolved_motion.jsonl`. Only the first file contains automatic
+technique labels. Unresolved motion stays visible for review and is never
+forced into a guessed class.
+
 Projects created by an earlier build should refresh the canonical identity map
 once. The existing map is backed up before replacement, then RTMPose is rerun
 so every pose row contains a canonical `fighter_id`:

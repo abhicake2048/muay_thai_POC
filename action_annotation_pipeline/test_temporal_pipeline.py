@@ -15,6 +15,7 @@ sys.path.insert(0, str(PIPELINE_ROOT))
 
 from common import raw_track_for_fighter, read_jsonl, write_json, write_jsonl  # noqa: E402
 from action_signals import build_fighter_timelines  # noqa: E402
+from action_diagnostics import build_report  # noqa: E402
 from export_posec3d import make_annotation  # noqa: E402
 from extract_tracks import SimpleFighterTracker  # noqa: E402
 from export_posec3d import main as export_posec3d_main  # noqa: E402
@@ -214,6 +215,26 @@ class TemporalPipelineTests(unittest.TestCase):
                 self.assertEqual(export_tridet_main(), 0)
             self.assertTrue((project / "exports" / "posec3d" / "posec3d_annotations.pkl").is_file())
             self.assertTrue((project / "exports" / "tridet" / "annotations.json").is_file())
+
+    def test_pose_diagnostics_ignore_stale_empty_qwen_run(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary)
+            self.make_synthetic_project(project)
+            (project / "proposals" / "raw" / "qwen").mkdir(parents=True)
+            write_json(project / "proposals" / "raw" / "qwen" / "summary.json", {
+                "tasks": 10, "events": 0, "failures": 0,
+            })
+            write_jsonl(project / "proposals" / "fused_proposals.jsonl", [{
+                "event_id": "motion", "actor_id": 0, "target_id": 1,
+                "start_sec": 1.6, "peak_sec": 1.8, "end_sec": 1.9,
+                "technique": "unknown_action", "branch_evidence": [],
+            }])
+            pose_report = build_report(project, "pose")
+            self.assertTrue(pose_report["ok"])
+            self.assertTrue(pose_report["qwen"]["ignored_stale_summary_in_pose_mode"])
+            hybrid_report = build_report(project, "hybrid")
+            self.assertFalse(hybrid_report["ok"])
+            self.assertIn("Qwen processed windows but produced zero normalized action events", hybrid_report["critical_failures"])
 
 
 if __name__ == "__main__":

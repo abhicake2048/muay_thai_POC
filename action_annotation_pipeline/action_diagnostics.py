@@ -53,7 +53,7 @@ def _branch_summary(path: Path) -> dict[str, Any]:
     }
 
 
-def build_report(project: Path) -> dict[str, Any]:
+def build_report(project: Path, expected_classifier: str = "auto") -> dict[str, Any]:
     manifest = load_manifest(project)
     fighter_map = load_fighter_map(project)
     poses_path = project / "poses" / "poses.npz"
@@ -73,6 +73,8 @@ def build_report(project: Path) -> dict[str, Any]:
     branch_paths = sorted((project / "proposals" / "branches").glob("*.jsonl"))
     branches = {path.stem: _branch_summary(path) for path in branch_paths}
     fused = _rows(project / "proposals" / "fused_proposals.jsonl")
+    classified = [row for row in fused if str(row.get("technique", "unknown_action")) != "unknown_action"]
+    unresolved = [row for row in fused if str(row.get("technique", "unknown_action")) == "unknown_action"]
     fused_peaks = [float(row.get("peak_sec", 0.0)) for row in fused]
     learned_names = {"qwen_actions", "qwen3_vl", "posec3d", "boxing6_posec3d", "tridet"}
     classifier_branches = {
@@ -99,13 +101,18 @@ def build_report(project: Path) -> dict[str, Any]:
         message = "proposals stop before the pose timeline ends"
         warnings.append(message)
         critical.append(message)
-    if fused and all(str(row.get("technique", "unknown_action")) == "unknown_action" for row in fused):
+    classifier_expected = expected_classifier in {"hybrid", "required"}
+    if classifier_expected and fused and not classified:
         warnings.append("all proposals are unknown_action; no successful technique classifier output was fused")
-    if not classifier_branches:
+        critical.append("hybrid mode produced no classified actions")
+    if classifier_expected and not classifier_branches:
         warnings.append("no technique-classifier branch ran; pose actionness can only suggest family/limb")
     qwen_summary_path = project / "proposals" / "raw" / "qwen" / "summary.json"
     qwen_summary = read_json(qwen_summary_path) if qwen_summary_path.is_file() else None
-    if qwen_summary and int(qwen_summary.get("tasks", 0)) > 0:
+    qwen_relevant = expected_classifier in {"hybrid", "required"} or (
+        expected_classifier == "auto" and bool(classifier_branches)
+    )
+    if qwen_relevant and qwen_summary and int(qwen_summary.get("tasks", 0)) > 0:
         if int(qwen_summary.get("events", 0)) == 0:
             message = "Qwen processed windows but produced zero normalized action events"
             warnings.append(message)
@@ -115,6 +122,10 @@ def build_report(project: Path) -> dict[str, Any]:
             warnings.append(
                 f"Qwen failed on {int(qwen_summary['failures'])}/{int(qwen_summary.get('tasks', 0))} tasks"
             )
+    if classifier_expected and unresolved:
+        warnings.append(
+            f"{len(unresolved)} motion candidates remain unclassified and are isolated from classified actions"
+        )
     fused_duplicates = _duplicate_summary(fused)
     if fused_duplicates["duplicate_rate"] > 0.15:
         message = f"fused proposals have a high exact-duplicate rate ({fused_duplicates['duplicate_rate']:.1%})"
@@ -155,7 +166,15 @@ def build_report(project: Path) -> dict[str, Any]:
             "duplicates": fused_duplicates,
         },
         "technique_classifier": {"ran": bool(classifier_branches), "branches": sorted(classifier_branches)},
-        "qwen": qwen_summary,
+        "classification": {
+            "expected_mode": expected_classifier,
+            "classified_actions": len(classified),
+            "unresolved_motion_candidates": len(unresolved),
+            "classification_coverage": round(len(classified) / max(len(fused), 1), 6),
+            "classified_output": str(project / "proposals" / "classified_actions.jsonl"),
+            "unresolved_output": str(project / "proposals" / "unresolved_motion.jsonl"),
+        },
+        "qwen": qwen_summary if qwen_relevant else {"ignored_stale_summary_in_pose_mode": bool(qwen_summary)},
         "pose_actionness": pose_report,
         "warnings": warnings,
         "critical_failures": critical,
@@ -204,6 +223,7 @@ def render_timeline(report: dict[str, Any], proposals: list[dict[str, Any]]) -> 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--project", type=Path, required=True)
+    parser.add_argument("--expected-classifier", choices=("auto", "pose", "hybrid", "required"), default="auto")
     parser.add_argument("--overwrite", action="store_true", help="Accepted for resumable stage compatibility")
     return parser.parse_args()
 
@@ -212,7 +232,7 @@ def main() -> int:
     args = parse_args()
     try:
         project = args.project.expanduser().resolve()
-        report = build_report(project)
+        report = build_report(project, args.expected_classifier)
         output = project / "qa" / "action_diagnostics.json"
         timeline = project / "qa" / "action_timeline.html"
         write_json(output, report)

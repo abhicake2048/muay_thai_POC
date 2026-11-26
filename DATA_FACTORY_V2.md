@@ -181,6 +181,14 @@ identical intervals. A component is split only when separated peaks have a
 sustained valley, preserving fast combinations. `pose_attributes` enriches the
 pose event and is not counted as an independent second vote during fusion.
 
+Pose-only mode is a candidate generator, not a technique classifier. Hybrid
+mode writes confirmed model classifications to
+`proposals/classified_actions.jsonl` and keeps unmatched pose motion in
+`proposals/unresolved_motion.jsonl`. This distinction prevents ordinary guard,
+footwork, or tracking noise from being forced into a punch/kick label. Human
+review can reject unresolved motion or assign a technique when the video makes
+it clear.
+
 Run only the action stages, reusing existing tracks and poses:
 
 ```powershell

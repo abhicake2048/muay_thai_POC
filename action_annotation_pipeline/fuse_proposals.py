@@ -280,7 +280,21 @@ def main() -> int:
         schema = read_json(project / "annotations" / "classes.json")
         fused = fuse(rows, schema, args.iou)
         write_jsonl(output, fused)
-        print(json.dumps({"input_rows": len(rows), "fused_proposals": len(fused), "output": str(output)}, indent=2))
+        classified = [row for row in fused if str(row.get("technique", "unknown_action")) not in UNKNOWN]
+        unresolved = [row for row in fused if str(row.get("technique", "unknown_action")) in UNKNOWN]
+        classified_output = project / "proposals" / "classified_actions.jsonl"
+        unresolved_output = project / "proposals" / "unresolved_motion.jsonl"
+        write_jsonl(classified_output, classified)
+        write_jsonl(unresolved_output, unresolved)
+        print(json.dumps({
+            "input_rows": len(rows),
+            "fused_proposals": len(fused),
+            "classified_actions": len(classified),
+            "unresolved_motion_candidates": len(unresolved),
+            "output": str(output),
+            "classified_output": str(classified_output),
+            "unresolved_output": str(unresolved_output),
+        }, indent=2))
         return 0
     except (OSError, ValueError, PipelineError) as exc:
         print(f"Error: {exc}", file=sys.stderr)

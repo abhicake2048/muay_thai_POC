@@ -204,13 +204,15 @@ def _run_action_stages(
             raise PipelineError(f"Model proposal branch not found: {branch_path}")
         branches.append(branch_path)
     fused = project / "proposals" / "fused_proposals.jsonl"
+    classified = project / "proposals" / "classified_actions.jsonl"
+    unresolved = project / "proposals" / "unresolved_motion.jsonl"
     _stage(
         project,
         "proposal_fusion",
         "fuse_proposals.py",
         ["--project", str(project), "--branches", *[str(path) for path in branches]],
         branches,
-        [fused],
+        [fused, classified, unresolved],
         overwrite,
     )
     diagnostics = project / "qa" / "action_diagnostics.json"
@@ -219,7 +221,7 @@ def _run_action_stages(
         project,
         "action_diagnostics",
         "action_diagnostics.py",
-        ["--project", str(project)],
+        ["--project", str(project), "--expected-classifier", mode],
         [tracks, poses, fighter_map, fused, *branches],
         [diagnostics, timeline],
         overwrite,
@@ -241,13 +243,26 @@ def command_actions(args: argparse.Namespace) -> int:
         model_branches=args.model_branch,
         overwrite=args.overwrite,
     )
-    print(json.dumps({"project": str(project), "mode": args.mode, "fused_proposals": str(fused), "diagnostics": str(project / 'qa' / 'action_diagnostics.json'), "human_review_required": True}, indent=2))
+    print(json.dumps({
+        "project": str(project),
+        "mode": args.mode,
+        "fused_proposals": str(fused),
+        "classified_actions": str(project / "proposals" / "classified_actions.jsonl"),
+        "unresolved_motion": str(project / "proposals" / "unresolved_motion.jsonl"),
+        "classification_note": "pose mode proposes motion only; hybrid mode is required for technique labels" if args.mode == "pose" else "hybrid classifier ran; unresolved motion remains separate for review",
+        "diagnostics": str(project / 'qa' / 'action_diagnostics.json'),
+        "human_review_required": True,
+    }, indent=2))
     return 0
 
 
 def command_diagnose_actions(args: argparse.Namespace) -> int:
     project = args.project.expanduser().resolve()
-    _run([sys.executable, str(_script("action_diagnostics.py")), "--project", str(project)], project / "logs" / "action_diagnostics.log")
+    _run([
+        sys.executable, str(_script("action_diagnostics.py")),
+        "--project", str(project),
+        "--expected-classifier", args.mode,
+    ], project / "logs" / "action_diagnostics.log")
     return 0
 
 
@@ -470,6 +485,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     diagnose_actions = subparsers.add_parser("diagnose-actions", help="Report action-pipeline temporal coverage and classifier health")
     diagnose_actions.add_argument("project", type=Path)
+    diagnose_actions.add_argument("--mode", choices=("auto", "pose", "hybrid", "required"), default="auto")
     diagnose_actions.set_defaults(func=command_diagnose_actions)
 
     review = subparsers.add_parser("review", help="Prepare or launch the FiftyOne review dataset")
