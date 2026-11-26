@@ -25,6 +25,8 @@ from propose_actions import generate_proposals  # noqa: E402
 from validate_events import validate  # noqa: E402
 from fuse_proposals import fuse  # noqa: E402
 from vlm_qwen import normalize_events, validate_vlm_payload  # noqa: E402
+from certify import certify  # noqa: E402
+from evaluate import evaluate as evaluate_project  # noqa: E402
 
 
 class TemporalPipelineTests(unittest.TestCase):
@@ -325,6 +327,85 @@ class TemporalPipelineTests(unittest.TestCase):
             tri_event = tridet["database"]["test__fighter0"]["annotations"][0]
             self.assertEqual(tri_event["segment_frames"], [5, 9])
             self.assertEqual(tri_event["label_id"], tridet["label_to_id"]["jab"])
+
+    def test_action_certification_reopens_structured_qwen_audit(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary)
+            self.make_synthetic_project(project)
+            (project / "proposals" / "branches").mkdir(parents=True, exist_ok=True)
+            (project / "proposals" / "raw" / "qwen").mkdir(parents=True, exist_ok=True)
+            action_payload = {
+                "contains_action": True,
+                "window_summary": "Fighter 0 throws one lead jab.",
+                "events": [{
+                    "start_offset_sec": 0.5, "peak_offset_sec": 0.7, "end_offset_sec": 0.9,
+                    "technique": "jab", "technique_candidates": [{"technique": "jab", "confidence": 0.9}],
+                    "anatomical_side": "left", "effector_limb": "hand", "stance_at_start": "orthodox",
+                    "stance_role": "lead", "target_zone": "head", "outcome": "attempted",
+                    "contact_surface": "fist", "visibility": "visible", "confidence": 0.9,
+                    "uncertainty_flags": [], "classification_reason": "The left wrist extends toward the head.",
+                    "boundary_reason": "Extension onset through retraction.", "visual_evidence": ["left elbow extends"],
+                }],
+                "no_action_confidence": 0.0, "no_action_reason": "",
+            }
+            no_action_payload = {
+                "contains_action": False, "window_summary": "Fighter 1 holds guard.", "events": [],
+                "no_action_confidence": 0.9, "no_action_reason": "No committed action is visible.",
+            }
+            assessments = [
+                {"task_id": "actor0", "actor_id": 0, "start_sec": 0.0, "end_sec": 2.0, "status": "action", "raw_record": "proposals/raw/qwen/actor0.json"},
+                {"task_id": "actor1", "actor_id": 1, "start_sec": 0.0, "end_sec": 2.0, "status": "no_action", "raw_record": "proposals/raw/qwen/actor1.json"},
+            ]
+            write_jsonl(project / "proposals" / "branches" / "qwen_window_assessments.jsonl", assessments)
+            write_json(project / "proposals" / "raw" / "qwen" / "actor0.json", {"parsed": action_payload})
+            write_json(project / "proposals" / "raw" / "qwen" / "actor1.json", {"parsed": no_action_payload})
+            write_json(project / "proposals" / "raw" / "qwen" / "summary.json", {
+                "tasks": 2, "events": 1, "failures": 0, "failed_windows": 0,
+                "action_windows": 1, "no_action_windows": 1, "scan_mode": "hybrid",
+                "window_assessments": str(project / "proposals" / "branches" / "qwen_window_assessments.jsonl"),
+            })
+            classified = {
+                "event_id": "fused_1", "event_type": "action", "actor_id": 0, "target_id": 1,
+                "start_sec": 0.5, "peak_sec": 0.7, "end_sec": 0.9, "technique": "jab",
+                "anatomical_side": "left", "effector_limb": "hand", "stance_at_start": "orthodox",
+                "stance_role": "lead", "target_zone": "head", "outcome": "attempted",
+                "contact_surface": "fist", "visibility": "visible", "review_status": "proposed",
+                "proposal_confidence": 0.9, "branch_evidence": [{"branch": "qwen_actions", "technique": "jab"}],
+            }
+            write_jsonl(project / "proposals" / "fused_proposals.jsonl", [classified])
+            write_jsonl(project / "proposals" / "classified_actions.jsonl", [classified])
+            report = certify(project, "actions")
+            self.assertTrue(report["passed"], report["failed_gates"])
+            write_json(project / "proposals" / "raw" / "qwen" / "actor1.json", {"parsed": {"contains_action": False, "events": []}})
+            failed = certify(project, "actions")
+            self.assertFalse(failed["passed"])
+            self.assertIn("qwen_structured_outputs_valid", failed["failed_gates"])
+
+    def test_pilot_metrics_require_temporal_match_and_use_proxy_fps(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary)
+            self.make_synthetic_project(project)
+            truth = {
+                "event_id": "jab", "event_type": "action", "actor_id": 0, "target_id": 1,
+                "start_sec": 0.5, "peak_sec": 0.7, "end_sec": 0.9, "label": "jab",
+                "anatomical_side": "left", "effector_limb": "hand", "stance_at_start": "orthodox",
+                "stance_role": "lead", "target_zone": "head", "outcome": "attempted",
+                "contact_surface": "fist", "visibility": "visible", "review_status": "verified",
+            }
+            write_jsonl(project / "annotations" / "events.jsonl", [
+                {"event_id": "review", "event_type": "review_range", "start_sec": 0.0, "peak_sec": 1.0, "end_sec": 2.0, "label": "reviewed", "review_status": "verified"},
+                truth,
+            ])
+            wrong_time = {**truth, "event_id": "proposal", "start_sec": 1.5, "peak_sec": 1.7, "end_sec": 1.9, "review_status": "proposed"}
+            write_jsonl(project / "proposals" / "fused_proposals.jsonl", [wrong_time])
+            missed = evaluate_project(project)
+            self.assertEqual(missed["metrics"]["proposal_recall_tiou_0.3"], 0.0)
+            self.assertEqual(missed["metrics"]["top3_technique_recall"], 0.0)
+            matched = {**truth, "event_id": "proposal", "peak_sec": 0.8, "review_status": "proposed"}
+            write_jsonl(project / "proposals" / "fused_proposals.jsonl", [matched])
+            report = evaluate_project(project)
+            self.assertAlmostEqual(report["metrics"]["median_peak_error_frames"], 1.0)
+            self.assertEqual(report["metrics"]["proxy_fps"], 10.0)
 
 
 if __name__ == "__main__":

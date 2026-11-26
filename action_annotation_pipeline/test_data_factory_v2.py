@@ -26,6 +26,7 @@ from vlm_qwen import _composite_frames, _content_fingerprint, _json_object, _tas
 from extract_videomae_features import pool_video_tokens, slice_stream_features  # noqa: E402
 from training_contracts import validate_tridet_payload  # noqa: E402
 from review import fiftyone_detections_to_events  # noqa: E402
+from evaluate import ranked_techniques  # noqa: E402
 
 import numpy as np
 import cv2
@@ -338,6 +339,20 @@ class DataFactoryV2Tests(unittest.TestCase):
         ]
         output = fuse(rows, self.schema)
         self.assertEqual(output[0]["anatomical_side"], "unknown")
+
+    def test_evaluation_uses_ranked_fused_and_branch_candidates(self) -> None:
+        proposal = {
+            "technique": "unknown_action",
+            "technique_candidates": [
+                {"technique": "hook", "confidence": 0.6},
+                {"technique": "jab", "confidence": 0.9},
+            ],
+            "branch_evidence": [{
+                "technique": "cross",
+                "technique_candidates": [{"technique": "uppercut", "confidence": 0.8}],
+            }],
+        }
+        self.assertEqual(ranked_techniques(proposal), ["jab", "hook", "cross"])
 
     def test_vlm_technique_must_match_pose_family(self) -> None:
         base = {"actor_id": 0, "target_id": 1, "start_sec": 1.0, "peak_sec": 1.3, "end_sec": 1.6, "event_type": "action", "review_status": "proposed", "anatomical_side": "left"}

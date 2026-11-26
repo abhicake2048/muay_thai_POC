@@ -65,6 +65,17 @@ Successful action and explicit no-action windows are fingerprinted and reused
 after an interrupted run; stale, failed, or invalid records are recomputed.
 `summary.json` reports `resumed_tasks` and `new_tasks_processed`.
 
+After hybrid inference, run the fail-closed action certification:
+
+```powershell
+python mtdata.py certify generated/action_annotations_v2/sparring_1 --stage actions
+```
+
+Later use `--stage reviewed`, `--stage exported`, and `--stage features` to
+verify the cumulative human-review, PoseC3D/TriDet, and feature contracts. The
+command exits nonzero and records every failed gate in
+`qa/pipeline_certification.json`; file existence alone never passes a gate.
+
 Open the generated `review/annotate.html` for the dependency-free reviewer, or
 install FiftyOne and add `--launch`. Closing the FiftyOne session writes
 `review/fiftyone_reviewed_events.jsonl`; labels named `reviewed`, `unreviewed`,
@@ -79,6 +90,10 @@ python mtdata.py sync-review generated/action_annotations_v2/sparring_1 reviewed
 python mtdata.py export generated/action_annotations_v2/sparring_1 --allow-partial
 python mtdata.py evaluate generated/action_annotations_v2/sparring_1
 ```
+
+`evaluate` returns success only when all pilot quality gates pass. Technique
+and side credit require a temporal match at tIoU 0.3, and peak-frame error uses
+the proxy's actual FPS.
 
 For training exports, `exports/posec3d/posec3d_annotations.pkl` follows the
 MMAction2 PoseDataset tensor contract (`[2,T,17,2]` keypoints and

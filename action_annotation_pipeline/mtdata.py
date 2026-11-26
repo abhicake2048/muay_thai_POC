@@ -373,6 +373,18 @@ def command_evaluate(args: argparse.Namespace) -> int:
     return 0
 
 
+def command_certify(args: argparse.Namespace) -> int:
+    project = args.project.expanduser().resolve()
+    _run([
+        sys.executable, str(_script("certify.py")),
+        "--project", str(project),
+        "--stage", args.stage,
+        "--minimum-classified", str(args.minimum_classified),
+        "--minimum-verified", str(args.minimum_verified),
+    ], project / "logs" / "certify.log")
+    return 0
+
+
 def command_features(args: argparse.Namespace) -> int:
     project = args.project.expanduser().resolve()
     manifest = read_json(project / "manifest.json")
@@ -526,6 +538,13 @@ def build_parser() -> argparse.ArgumentParser:
     evaluate_parser = subparsers.add_parser("evaluate", help="Score proposals and review readiness")
     evaluate_parser.add_argument("project", type=Path)
     evaluate_parser.set_defaults(func=command_evaluate)
+
+    certify_parser = subparsers.add_parser("certify", help="Fail-closed verification of pipeline artifacts")
+    certify_parser.add_argument("project", type=Path)
+    certify_parser.add_argument("--stage", choices=("actions", "reviewed", "exported", "features"), default="actions")
+    certify_parser.add_argument("--minimum-classified", type=int, default=1)
+    certify_parser.add_argument("--minimum-verified", type=int, default=1)
+    certify_parser.set_defaults(func=command_certify)
 
     features = subparsers.add_parser("features", help="Extract actor-conditioned local VideoMAE features")
     features.add_argument("project", type=Path)

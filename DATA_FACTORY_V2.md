@@ -342,12 +342,23 @@ Add `--execute` after the model name when the printed command is correct.
 
 ```powershell
 python mtdata.py evaluate PROJECT
+python mtdata.py certify PROJECT --stage actions
 ```
 
 The report measures proposal recall at tIoU 0.3, top-three technique recall,
-visible-side accuracy, median peak error and annotation validity. Missing
+visible-side accuracy, median peak error at the actual proxy FPS and annotation
+validity. Unmatched proposals cannot receive technique/side credit, and the
+command returns exit code 2 when any pilot acceptance gate fails. Missing
 optional dependencies are reported by `mtdata doctor`; the core pipeline does
 not require Qwen, SAM2, BoxMOT, FiftyOne, Sapiens or RTMW to remain usable.
+
+`mtdata certify` is the structural acceptance gate. Its stages are cumulative:
+`actions` verifies Qwen task/ledger parity, strict structured raw responses,
+zero failed windows, full fighter coverage and classified output; `reviewed`
+adds exhaustive human-review validation; `exported` reopens and validates the
+actual PoseC3D pickle and TriDet JSON; `features` also loads every actor-stream
+feature/timestamp array. It writes `qa/pipeline_certification.json` and returns
+exit code 2 whenever a required gate fails.
 
 Use `pipeline_state.sqlite3`, `logs/`, and `mtdata status` to diagnose a failed
 stage. A repaired stage resumes without repeating current predecessors.
