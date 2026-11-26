@@ -47,19 +47,12 @@ def fighter_map_coverage(
             for left, right in zip(merged[:-1], merged[1:])
             if right[0] - left[1] > tolerance
         ]
-        covers = bool(
-            merged
-            and start is not None
-            and end is not None
-            and start <= pose_start + tolerance
-            and end >= pose_end - tolerance
-        )
         fighters.append({
             "fighter_id": fighter_id,
             "coverage_start_sec": start,
             "coverage_end_sec": end,
             "gaps": gaps,
-            "covers_pose_span": covers,
+            "covers_observed_pose_span": False,
         })
 
     unmapped = 0
@@ -82,11 +75,30 @@ def fighter_map_coverage(
         row["observed_start_sec"] = min(observed) if observed else None
         row["observed_end_sec"] = max(observed) if observed else None
         row["mapped_pose_instances"] = len(observed)
+        row["covers_observed_pose_span"] = bool(
+            observed
+            and row["coverage_start_sec"] is not None
+            and row["coverage_end_sec"] is not None
+            and float(row["coverage_start_sec"]) <= float(row["observed_start_sec"]) + tolerance
+            and float(row["coverage_end_sec"]) >= float(row["observed_end_sec"]) - tolerance
+        )
     mapped = max(0, int(len(times)) - unmapped)
     mapped_ratio = mapped / max(1, int(len(times)))
+    all_intervals = [interval for intervals in intervals_by_fighter.values() for interval in intervals]
+    derived_processed_start = min((start for start, _ in all_intervals), default=None)
+    derived_processed_end = max((end for _, end in all_intervals), default=None)
+    map_processed_start = fighter_map.get("processed_start_sec", derived_processed_start)
+    map_processed_end = fighter_map.get("processed_end_sec", derived_processed_end)
+    processed_covers_pose_span = bool(
+        map_processed_start is not None
+        and map_processed_end is not None
+        and float(map_processed_start) <= pose_start + tolerance
+        and float(map_processed_end) >= pose_end - tolerance
+    )
     complete = bool(
         mapped_ratio >= 0.95
-        and all(item["covers_pose_span"] and item["mapped_pose_instances"] > 0 for item in fighters)
+        and processed_covers_pose_span
+        and all(item["covers_observed_pose_span"] and item["mapped_pose_instances"] > 0 for item in fighters)
     )
     return {
         "pose_start_sec": pose_start,
@@ -99,8 +111,10 @@ def fighter_map_coverage(
         "mapped_instances_by_fighter": dict(sorted(mapped_by_fighter.items())),
         "fighters": fighters,
         "complete": complete,
+        "processed_covers_pose_span": processed_covers_pose_span,
         "map_review_status": fighter_map.get("review_status", "legacy_unknown"),
-        "map_processed_end_sec": fighter_map.get("processed_end_sec"),
+        "map_processed_start_sec": map_processed_start,
+        "map_processed_end_sec": map_processed_end,
     }
 
 
@@ -108,7 +122,8 @@ def require_fighter_map_coverage(report: dict[str, Any]) -> None:
     if report.get("complete"):
         return
     details = ", ".join(
-        f"fighter {row['fighter_id']}: {row['coverage_start_sec']}..{row['coverage_end_sec']}"
+        f"fighter {row['fighter_id']}: map={row['coverage_start_sec']}..{row['coverage_end_sec']}, "
+        f"observed={row.get('observed_start_sec')}..{row.get('observed_end_sec')}"
         for row in report.get("fighters", [])
     )
     raise PipelineError(

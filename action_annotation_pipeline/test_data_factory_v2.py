@@ -74,6 +74,25 @@ class DataFactoryV2Tests(unittest.TestCase):
         self.assertFalse(report["complete"])
         self.assertEqual(report["unmapped_pose_instances"], 2)
 
+    def test_fighter_may_end_before_other_when_its_own_poses_are_fully_covered(self) -> None:
+        mapping = {
+            "processed_start_sec": 0.0,
+            "processed_end_sec": 190.533,
+            "fighters": [
+                {"fighter_id": 0, "track_segments": [{"track_id": 10, "start_sec": 0, "end_sec": 190.55}]},
+                {"fighter_id": 1, "track_segments": [{"track_id": 11, "start_sec": 0, "end_sec": 189.683}]},
+            ],
+        }
+        report = fighter_map_coverage(
+            mapping,
+            np.asarray([0.0, 0.0, 189.667, 190.533]),
+            np.asarray([10, 11, 11, 10]),
+            2,
+            canonical_fighters=np.asarray([0, 1, 1, 0]),
+        )
+        self.assertTrue(report["complete"])
+        self.assertTrue(report["fighters"][1]["covers_observed_pose_span"])
+
     def test_only_automatic_fighter_maps_are_replaced(self) -> None:
         previous = {"fighters": [{"fighter_id": 0, "track_segments": [{"track_id": 1, "start_sec": 0, "end_sec": 4}]}]}
         self.assertTrue(_was_automatic_map(dict(previous), previous))
