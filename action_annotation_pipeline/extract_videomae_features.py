@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import sys
 from collections import defaultdict
@@ -13,6 +14,25 @@ import cv2
 import numpy as np
 
 from common import PipelineError, canonical_fighter_for_track, load_fighter_map, load_manifest, read_json, read_jsonl, write_json
+from training_contracts import validate_feature_array
+
+
+def pool_video_tokens(hidden: Any) -> np.ndarray:
+    """Pool only the patch/tubelet token axis of a [1,tokens,channels] tensor."""
+    if hidden.ndim != 3 or hidden.shape[0] != 1:
+        raise PipelineError(f"Unexpected VideoMAE hidden state shape: {tuple(hidden.shape)}")
+    vector = hidden.float().mean(dim=1).cpu().numpy()[0]
+    if vector.ndim != 1 or vector.shape[0] < 2:
+        raise PipelineError(f"Invalid pooled VideoMAE feature shape: {vector.shape}")
+    return vector
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def parse_args() -> argparse.Namespace:
@@ -80,7 +100,10 @@ def main() -> int:
                 boxes: dict[int, list[float]] = {}
                 for detection in tracks_by_frame.get(frame_index, []):
                     raw = int(detection["track_id"])
-                    fighter = canonical_fighter_for_track(fighter_map, raw, frame_index / fps)
+                    fighter_value = detection.get("fighter_id")
+                    fighter = int(fighter_value) if fighter_value is not None else canonical_fighter_for_track(
+                        fighter_map, raw, frame_index / fps
+                    )
                     if fighter is not None:
                         boxes[fighter] = list(detection["bbox_xyxy"])
                 for fighter in range(expected):
@@ -93,7 +116,10 @@ def main() -> int:
                         inputs = {key: value.to(args.device) for key, value in inputs.items()}
                         with torch.inference_mode():
                             hidden = model(**inputs).last_hidden_state
-                        features[fighter].append(hidden.float().mean(dim=tuple(range(1, hidden.ndim))).cpu().numpy()[0])
+                        # Pool patch/tubelet tokens only. Averaging the hidden
+                        # dimension as well would collapse every temporal step
+                        # to one scalar and make it unusable by TriDet.
+                        features[fighter].append(pool_video_tokens(hidden))
                     timestamps.append(frame_index / fps)
                 frame_index += 1
         finally:
@@ -102,9 +128,12 @@ def main() -> int:
         feature_manifest = read_json(project / "exports" / "tridet" / "feature_manifest.json") if (project / "exports" / "tridet" / "feature_manifest.json").is_file() else {}
         for fighter, path in enumerate(outputs):
             array = np.asarray(features[fighter], dtype=np.float16)
+            feature_errors = validate_feature_array(array, len(timestamps))
+            if feature_errors:
+                raise PipelineError(f"Invalid TriDet features for fighter {fighter}: {'; '.join(feature_errors)}")
             np.save(path, array)
             stream = f"{manifest['video_id']}__fighter{fighter}"
-            feature_manifest[stream] = {"feature_file": str(path.relative_to(project / "exports" / "tridet")), "status": "complete", "shape": list(array.shape), "dtype": "float16", "actor_id": fighter, "feat_stride_frames": args.stride, "clip_frames": args.clip_frames, "model": str(model_path), "local_only": True}
+            feature_manifest[stream] = {"feature_file": str(path.relative_to(project / "exports" / "tridet")), "status": "complete", "shape": list(array.shape), "dtype": "float16", "sha256": _sha256(path), "actor_id": fighter, "feat_stride_frames": args.stride, "clip_frames": args.clip_frames, "feature_dim": int(array.shape[1]), "fps": fps, "model": str(model_path), "local_only": True}
         np.save(output_dir / "timestamps.npy", np.asarray(timestamps, dtype=np.float32))
         write_json(project / "exports" / "tridet" / "feature_manifest.json", feature_manifest)
         summary = {"streams": expected, "feature_steps": len(timestamps), "stride_frames": args.stride, "outputs": [str(path) for path in outputs]}

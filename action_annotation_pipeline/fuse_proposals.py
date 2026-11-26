@@ -240,6 +240,10 @@ def fuse(branch_rows: list[dict[str, Any]], schema: dict[str, Any], iou_threshol
             "anatomical_side": row.get("anatomical_side", row.get("side")),
             "technique_candidates": row.get("technique_candidates", []),
             "effector_limb": row.get("effector_limb"),
+            "classification_reason": row.get("classification_reason", ""),
+            "boundary_reason": row.get("boundary_reason", ""),
+            "visual_evidence": row.get("visual_evidence", []),
+            "window_summary": row.get("window_summary", ""),
         } for row in cluster]
         fused["review_status"] = "proposed"
         fused["source"] = "fused_proposal"
@@ -270,7 +274,10 @@ def main() -> int:
         output = project / "proposals" / "fused_proposals.jsonl"
         if output.exists() and output.stat().st_size and not args.overwrite:
             raise PipelineError(f"Output exists: {output}; use --overwrite")
-        branch_paths = [path.resolve() for path in args.branches] if args.branches else sorted((project / "proposals" / "branches").glob("*.jsonl"))
+        branch_paths = [path.resolve() for path in args.branches] if args.branches else [
+            path for path in sorted((project / "proposals" / "branches").glob("*.jsonl"))
+            if path.stem != "qwen_window_assessments"
+        ]
         rows: list[dict[str, Any]] = []
         for path in branch_paths:
             if path.is_file():

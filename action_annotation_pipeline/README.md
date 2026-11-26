@@ -49,7 +49,18 @@ python mtdata.py infer generated/action_annotations_v2/sparring_1 `
 The action stage now uses component-first temporal segmentation (one interval
 per motion component), ordered Qwen video input at 8 FPS, actor-crop coverage
 checks, and cross-window duplicate fusion. Check the generated Qwen preview
-contact sheets and `proposals/raw/qwen/summary.json` before review.
+contact sheets and `proposals/raw/qwen/summary.json` before review. Every Qwen
+window must now return one of two validated results:
+
+- one or more actions with ordered boundaries, ranked technique, confidence,
+  concise observable classification/boundary evidence; or
+- an explicit no-action decision with confidence and an observable reason.
+
+The complete audit ledger is
+`proposals/branches/qwen_window_assessments.jsonl`; malformed or semantically
+incomplete JSON is retried once and then recorded as a failed window. Hybrid
+diagnostics fail when dense assessment coverage is incomplete. Raw prompts,
+responses, crop coverage and normalized IDs remain in `proposals/raw/qwen/`.
 
 Open the generated `review/annotate.html` for the dependency-free reviewer, or
 install FiftyOne and add `--launch`. After exporting reviewed JSONL:
@@ -59,6 +70,15 @@ python mtdata.py sync-review generated/action_annotations_v2/sparring_1 reviewed
 python mtdata.py export generated/action_annotations_v2/sparring_1 --allow-partial
 python mtdata.py evaluate generated/action_annotations_v2/sparring_1
 ```
+
+For training exports, `exports/posec3d/posec3d_annotations.pkl` follows the
+MMAction2 PoseDataset tensor contract (`[2,T,17,2]` keypoints and
+`[2,T,17]` confidence). Exact reviewed event seconds and proxy frames are also
+stored in each action sample and in `sample_metadata.jsonl`. TriDet annotations
+contain stream FPS, second/frame segments and stable `label_id` values. Run
+`mtdata features` before `mtdata freeze`; freezing now copies each
+actor-conditioned `[T,C]` VideoMAE array into `tridet_features/` and rejects an
+incomplete training package.
 
 See `DATA_FACTORY_V2.md` in the repository root for setup, full-profile model
 adapters, CVAT handoff, training and dataset-freeze instructions.

@@ -196,6 +196,7 @@ function buildEvent() {
   const previousId = previous ? previous.event_id : null;
   const id = previousId || `evt_${String(Date.now())}_${Math.floor(Math.random()*1000)}`;
   const technique = $('label').value, side = $('side').value, limb = $('effectorLimb').value;
+  const fps = Number($('fps').value) || 30;
   return {
     event_id: id,
     event_type: type,
@@ -204,6 +205,10 @@ function buildEvent() {
     start_sec: Number(stamps.start.toFixed(6)),
     peak_sec: Number(peak.toFixed(6)),
     end_sec: Number(stamps.end.toFixed(6)),
+    proxy_fps: fps,
+    proxy_start_frame: Math.round(stamps.start * fps),
+    proxy_peak_frame: Math.round(peak * fps),
+    proxy_end_frame: Math.round(stamps.end * fps),
     label: technique,
     technique,
     action_family: type === 'action' ? actionFamily(technique) : null,
@@ -230,6 +235,10 @@ function buildEvent() {
     family_candidates: previous?.family_candidates || [],
     field_confidence: previous?.field_confidence || {},
     branch_evidence: previous?.branch_evidence || [],
+    classification_reason: previous?.classification_reason || '',
+    boundary_reason: previous?.boundary_reason || '',
+    visual_evidence: previous?.visual_evidence || [],
+    window_summary: previous?.window_summary || '',
     source: selectedIndex >= 0 && String(events[selectedIndex].source || '').includes('proposal') ? 'proposal_reviewed' : 'manual',
     annotation_revision: selectedIndex >= 0 ? Number(events[selectedIndex].annotation_revision || 0) + 1 : 1,
     provenance: {...(previous?.provenance || {}), source: selectedIndex >= 0 ? 'review_edit' : 'manual', imported_event_id: previousId}
@@ -259,8 +268,13 @@ function editEvent(index) {
   $('counterTo').value = e.counter_to_event_id || ''; $('possibleCause').value = e.possible_cause || '';
   $('notes').value = e.notes || ''; $('save').textContent = 'A: update event';
   const candidates = (e.technique_candidates || []).map(x => `${x.technique || x.label}: ${Number(x.confidence || 0).toFixed(3)}`).join(', ') || 'none';
-  const branches = (e.branch_evidence || []).map(x => `${x.branch}: ${x.technique || 'unknown'} (${Number(x.confidence || 0).toFixed(3)})`).join('\n') || 'none';
-  $('evidence').textContent = `Top techniques: ${candidates}\nBranch evidence:\n${branches}`;
+  const branches = (e.branch_evidence || []).map(x => {
+    const observations = (x.visual_evidence || []).join('; ');
+    return `${x.branch}: ${x.technique || 'unknown'} (${Number(x.confidence || 0).toFixed(3)})\n  classification: ${x.classification_reason || 'not supplied'}\n  boundaries: ${x.boundary_reason || 'not supplied'}\n  evidence: ${observations || 'not supplied'}`;
+  }).join('\n') || 'none';
+  const frames = [e.proxy_start_frame, e.proxy_peak_frame, e.proxy_end_frame].every(Number.isFinite)
+    ? `${e.proxy_start_frame}/${e.proxy_peak_frame}/${e.proxy_end_frame}` : 'computed on save';
+  $('evidence').textContent = `Frames start/peak/end: ${frames}\nWindow: ${e.window_summary || 'not supplied'}\nTop techniques: ${candidates}\nBranch evidence:\n${branches}`;
   video.currentTime = Math.max(0, Number(e.start_sec)); render();
 }
 function render() {

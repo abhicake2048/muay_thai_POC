@@ -7,11 +7,23 @@ import hashlib
 import json
 import pickle
 import random
+import shutil
 import sys
 from pathlib import Path
 from typing import Any
 
+import numpy as np
+
 from common import PipelineError, read_json, read_jsonl, write_json, write_jsonl
+from training_contracts import validate_feature_array, validate_tridet_payload
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def discover_projects(root: Path) -> list[Path]:
@@ -44,7 +56,9 @@ def freeze(root: Path, output: Path, seed: int) -> dict[str, Any]:
     canonical_class_map: dict[str, Any] | None = None
     canonical_augmentation: dict[str, Any] | None = None
     tridet_taxonomy: list[str] | None = None
+    tridet_label_to_id: dict[str, int] | None = None
     tridet_metadata: dict[str, Any] | None = None
+    feature_sources: list[tuple[str, Path, Path | None, str]] = []
     missing = []
     for project, manifest in manifests.items():
         video_id = str(manifest["video_id"])
@@ -80,29 +94,71 @@ def freeze(root: Path, output: Path, seed: int) -> dict[str, Any]:
         if tridet_taxonomy is not None and taxonomy != tridet_taxonomy:
             raise PipelineError(f"TriDet taxonomy differs in project {video_id}")
         tridet_taxonomy = taxonomy
+        label_to_id = dict(tri_payload.get("label_to_id", {}))
+        if tridet_label_to_id is not None and label_to_id != tridet_label_to_id:
+            raise PipelineError(f"TriDet label map differs in project {video_id}")
+        tridet_label_to_id = label_to_id
         if tridet_metadata is None:
             tridet_metadata = dict(tri_payload.get("metadata", {}))
+        feature_manifest_path = project / "exports" / "tridet" / "feature_manifest.json"
+        if not feature_manifest_path.is_file():
+            raise PipelineError(f"TriDet feature manifest is missing for {video_id}; run mtdata features first")
+        feature_manifest = read_json(feature_manifest_path)
+        timestamps_source = project / "exports" / "tridet" / "features" / "timestamps.npy"
         for stream_id, record in tri_payload["database"].items():
             value = dict(record)
             value["subset"] = {"train": "training", "val": "validation", "test": "testing"}[split]
             tridet_database[stream_id] = value
+            feature_record = feature_manifest.get(stream_id, {})
+            feature_path = project / "exports" / "tridet" / str(feature_record.get("feature_file", ""))
+            if feature_record.get("status") != "complete" or not feature_path.is_file():
+                raise PipelineError(f"TriDet feature array is missing or incomplete for {stream_id}; run mtdata features first")
+            feature_array = np.load(feature_path, mmap_mode="r")
+            feature_errors = validate_feature_array(feature_array)
+            if feature_errors:
+                raise PipelineError(f"TriDet feature array is invalid for {stream_id}: {'; '.join(feature_errors)}")
+            feature_sources.append((stream_id, feature_path, timestamps_source if timestamps_source.is_file() else None, _sha256(feature_path)))
     if missing:
         raise PipelineError(f"Projects are not fully exported: {', '.join(missing)}")
     output.mkdir(parents=True, exist_ok=True)
+    feature_output = output / "tridet_features"
+    feature_output.mkdir(parents=True, exist_ok=True)
+    frozen_feature_manifest: dict[str, Any] = {}
+    feature_checksums: dict[str, str] = {}
+    for stream_id, source, timestamps_source, checksum in feature_sources:
+        destination = feature_output / f"{stream_id}.npy"
+        shutil.copy2(source, destination)
+        timestamp_destination = output / "tridet_timestamps" / f"{stream_id}.npy"
+        if timestamps_source is not None:
+            timestamp_destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(timestamps_source, timestamp_destination)
+        frozen_feature_manifest[stream_id] = {
+            "feature_file": str(destination.relative_to(output)),
+            "timestamps_file": str(timestamp_destination.relative_to(output)) if timestamps_source is not None else None,
+            "status": "complete",
+            "sha256": checksum,
+        }
+        feature_checksums[stream_id] = checksum
     with (output / "posec3d_annotations.pkl").open("wb") as handle:
         pickle.dump({"split": pose_split, "annotations": pose_annotations}, handle, protocol=pickle.HIGHEST_PROTOCOL)
     write_json(output / "posec3d_class_map.json", canonical_class_map or {})
     write_json(output / "posec3d_augmentation_policy.json", canonical_augmentation or {})
     write_jsonl(output / "posec3d_sample_metadata.jsonl", pose_metadata)
-    write_json(output / "tridet_annotations.json", {
+    tridet_payload = {
         "version": "muay_thai_actions_v2",
         "taxonomy": tridet_taxonomy or [],
+        "label_to_id": tridet_label_to_id or {},
         "database": tridet_database,
         "metadata": tridet_metadata or {},
-    })
+    }
+    contract_errors = validate_tridet_payload(tridet_payload, require_training_subset=True)
+    if contract_errors:
+        raise PipelineError(f"Frozen TriDet contract failed: {'; '.join(contract_errors[:5])}")
+    write_json(output / "tridet_annotations.json", tridet_payload)
+    write_json(output / "tridet_feature_manifest.json", frozen_feature_manifest)
     leakage = {video: split for video, split in source_to_split.items()}
-    fingerprint = hashlib.sha256(json.dumps({"splits": splits, "pose_samples": len(pose_annotations), "streams": sorted(tridet_database)}, sort_keys=True).encode()).hexdigest()
-    report = {"dataset_version": "1.0", "fingerprint": fingerprint, "seed": seed, "projects": len(projects), "posec3d_samples": len(pose_annotations), "tridet_streams": len(tridet_database), "source_splits": leakage, "splits": splits, "leakage_check": "passed"}
+    fingerprint = hashlib.sha256(json.dumps({"splits": splits, "pose_samples": len(pose_annotations), "streams": sorted(tridet_database), "feature_checksums": feature_checksums}, sort_keys=True).encode()).hexdigest()
+    report = {"dataset_version": "1.0", "fingerprint": fingerprint, "seed": seed, "projects": len(projects), "posec3d_samples": len(pose_annotations), "tridet_streams": len(tridet_database), "tridet_feature_files": len(frozen_feature_manifest), "source_splits": leakage, "splits": splits, "leakage_check": "passed"}
     write_json(output / "split_manifest.json", report)
     write_json(output / "dataset_card.json", {**report, "human_verified_only": True, "canonical_schema": "Muay Thai Data Factory v2", "limitations": ["Anatomical side marked unknown when not visible", "No punch trajectory/line label", "Source videos, not clips, are the split unit"]})
     return report

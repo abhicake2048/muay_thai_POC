@@ -21,7 +21,10 @@ from schema import canonicalize_event, display_label  # noqa: E402
 from state import StageState, stage_signature  # noqa: E402
 from validate_events import validate  # noqa: E402
 from benchmark_trackers import score_tracker  # noqa: E402
-from vlm_qwen import _json_object, build_scan_tasks, normalize_events  # noqa: E402
+from action_diagnostics import _assessment_coverage  # noqa: E402
+from vlm_qwen import _json_object, build_scan_tasks, normalize_events, validate_vlm_payload  # noqa: E402
+from extract_videomae_features import pool_video_tokens  # noqa: E402
+from training_contracts import validate_tridet_payload  # noqa: E402
 
 import numpy as np
 
@@ -107,6 +110,15 @@ class DataFactoryV2Tests(unittest.TestCase):
         self.assertEqual({task["actor_id"] for task in tasks}, {0, 1})
         self.assertTrue(all(task["kind"] == "dense" for task in tasks))
 
+    def test_qwen_assessment_coverage_counts_explicit_no_action_windows(self) -> None:
+        rows = [
+            {"actor_id": fighter, "start_sec": start, "end_sec": end, "status": "no_action"}
+            for fighter in (0, 1) for start, end in ((0.0, 3.0), (3.0, 6.0))
+        ]
+        coverage = _assessment_coverage(rows, 2, 6.0)
+        self.assertEqual(coverage["0"]["coverage_ratio"], 1.0)
+        self.assertEqual(coverage["1"]["coverage_ratio"], 1.0)
+
     def test_candidate_vlm_windows_are_grouped_before_model_inference(self) -> None:
         rows = [
             {"event_id": f"p{index}", "actor_id": 0, "peak_sec": peak, "proposal_confidence": 0.8}
@@ -159,6 +171,54 @@ class DataFactoryV2Tests(unittest.TestCase):
             _json_object("not JSON")
         with self.assertRaises(ValueError):
             _json_object('{"events":"jab"}')
+
+    def test_vlm_contract_requires_explicit_explained_action_or_no_action(self) -> None:
+        action = {
+            "contains_action": True,
+            "window_summary": "Actor extends the lead hand and retracts.",
+            "events": [{
+                "start_offset_sec": 0.2, "peak_offset_sec": 0.4, "end_offset_sec": 0.7,
+                "technique": "jab", "confidence": 0.8,
+                "technique_candidates": [{"technique": "jab", "confidence": 0.8}],
+                "anatomical_side": "left", "effector_limb": "hand",
+                "stance_at_start": "orthodox", "stance_role": "lead",
+                "target_zone": "head", "outcome": "attempted", "contact_surface": "fist",
+                "visibility": "visible", "uncertainty_flags": [],
+                "classification_reason": "Lead hand travels straight toward the head.",
+                "boundary_reason": "Extension onset through completed retraction.",
+                "visual_evidence": ["wrist advances", "elbow extends"],
+            }],
+            "no_action_confidence": 0.0,
+            "no_action_reason": "",
+        }
+        self.assertIs(validate_vlm_payload(action, 3.0, set(self.schema["primary_action_classes"]), self.schema), action)
+        no_action = {
+            "contains_action": False, "window_summary": "Both fighters circle without a strike.",
+            "events": [], "no_action_confidence": 0.91,
+            "no_action_reason": "Only footwork and guard adjustment are visible.",
+        }
+        self.assertIs(validate_vlm_payload(no_action, 3.0, set(self.schema["primary_action_classes"]), self.schema), no_action)
+        invalid = dict(no_action, contains_action=True)
+        with self.assertRaises(ValueError):
+            validate_vlm_payload(invalid, 3.0, set(self.schema["primary_action_classes"]), self.schema)
+
+    def test_videomae_pooling_preserves_channel_dimension(self) -> None:
+        class TensorStub:
+            def __init__(self, array):
+                self.array = np.asarray(array)
+                self.ndim = self.array.ndim
+                self.shape = self.array.shape
+            def float(self):
+                return self
+            def mean(self, dim):
+                return TensorStub(self.array.mean(axis=dim))
+            def cpu(self):
+                return self
+            def numpy(self):
+                return self.array
+        vector = pool_video_tokens(TensorStub(np.arange(24).reshape(1, 3, 8)))
+        self.assertEqual(vector.shape, (8,))
+        self.assertTrue(np.allclose(vector, np.arange(8) + 8))
 
     def test_conflicting_low_confidence_side_stays_unknown(self) -> None:
         base = {"actor_id": 0, "target_id": 1, "start_sec": 1.0, "peak_sec": 1.3, "end_sec": 1.6, "event_type": "action", "review_status": "proposed", "effector_limb": "hand"}
@@ -257,11 +317,25 @@ class DataFactoryV2Tests(unittest.TestCase):
                     pickle.dump({"split": {"train": [sample["frame_dir"]]}, "annotations": [sample]}, handle)
                 write_json(project / "exports" / "posec3d" / "class_map.json", {"classes": ["jab"]})
                 write_json(project / "exports" / "posec3d" / "augmentation_policy.json", {"apply_at_training_time_only": True})
-                write_json(project / "exports" / "tridet" / "annotations.json", {"taxonomy": ["jab"], "database": {f"video{index}__fighter0": {"source_video": f"video{index}", "annotations": []}}})
+                stream_id = f"video{index}__fighter0"
+                write_json(project / "exports" / "tridet" / "annotations.json", {
+                    "taxonomy": ["jab"], "label_to_id": {"jab": 0},
+                    "database": {stream_id: {"source_video": f"video{index}", "duration": 2.0, "fps": 30.0, "subset": "training", "annotations": []}},
+                })
+                feature_dir = project / "exports" / "tridet" / "features"
+                feature_dir.mkdir()
+                np.save(feature_dir / f"{stream_id}.npy", np.ones((4, 8), dtype=np.float16))
+                np.save(feature_dir / "timestamps.npy", np.arange(4, dtype=np.float32))
+                write_json(project / "exports" / "tridet" / "feature_manifest.json", {
+                    stream_id: {"feature_file": f"features/{stream_id}.npy", "status": "complete"}
+                })
             report = freeze(root, Path(temporary) / "frozen", 42)
             self.assertEqual(report["leakage_check"], "passed")
+            self.assertEqual(report["tridet_feature_files"], 3)
             assigned = [video for split in report["splits"].values() for video in split]
             self.assertEqual(len(assigned), len(set(assigned)))
+            frozen = read_json(Path(temporary) / "frozen" / "tridet_annotations.json")
+            self.assertEqual(validate_tridet_payload(frozen, require_training_subset=True), [])
 
     def test_tracker_benchmark_counts_identity_switches(self) -> None:
         gold = [

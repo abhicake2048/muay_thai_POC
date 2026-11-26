@@ -45,6 +45,8 @@ def main() -> int:
         if not proposal_path.is_file() or not proposal_path.stat().st_size:
             proposal_path = project / "proposals" / "action_proposals.jsonl"
         proposals = read_jsonl(proposal_path) if proposal_path.is_file() and proposal_path.stat().st_size else []
+        assessments_path = project / "proposals" / "branches" / "qwen_window_assessments.jsonl"
+        assessments = read_jsonl(assessments_path) if assessments_path.is_file() and assessments_path.stat().st_size else []
         # Refresh the dependency-free reviewer for existing projects as the
         # proposal evidence UI evolves; reviewed event files are untouched.
         shutil.copy2(Path(__file__).parent / "annotator" / "index.html", project / "review" / "annotate.html")
@@ -53,6 +55,8 @@ def main() -> int:
             "schema_version": "2.0", "project": manifest["project_id"],
             "video": manifest["paths"]["proxy_video"], "proposals": str(proposal_path),
             "proposal_count": len(proposals), "fiftyone_dataset": f"mtdata_{manifest['project_id']}",
+            "qwen_window_assessments": str(assessments_path) if assessments_path.is_file() else None,
+            "qwen_window_assessment_count": len(assessments),
             "cvat_label_contract": str(project / "review" / "cvat_label_contract.json"),
             "human_verification_required": True,
         }
@@ -77,12 +81,26 @@ def main() -> int:
                     support=[int(round(float(event["start_sec"]) * fps)) + 1, int(round(float(event["end_sec"]) * fps)) + 1],
                     confidence=float(event.get("proposal_confidence", 0.0)),
                 )
-                for key in ("event_id", "actor_id", "target_id", "anatomical_side", "effector_limb", "effector_id", "stance_at_start", "stance_role", "target_zone", "outcome", "contact_surface", "visibility", "review_status"):
+                for key in ("event_id", "actor_id", "target_id", "anatomical_side", "effector_limb", "effector_id", "stance_at_start", "stance_role", "target_zone", "outcome", "contact_surface", "visibility", "review_status", "proxy_start_frame", "proxy_peak_frame", "proxy_end_frame", "classification_reason", "boundary_reason", "window_summary"):
                     detection[key] = event.get(key)
                 detection["technique_candidates"] = json.dumps(event.get("technique_candidates", []), ensure_ascii=False)
                 detection["branch_evidence"] = json.dumps(event.get("branch_evidence", []), ensure_ascii=False)
+                detection["visual_evidence"] = json.dumps(event.get("visual_evidence", []), ensure_ascii=False)
                 detections.append(detection)
             sample["action_proposals"] = fo.TemporalDetections(detections=detections)
+            assessment_detections = []
+            for assessment in assessments:
+                status = str(assessment.get("status", "unknown"))
+                value = fo.TemporalDetection(
+                    label=f"qwen_window__{status}",
+                    support=[int(round(float(assessment["start_sec"]) * fps)) + 1, int(round(float(assessment["end_sec"]) * fps)) + 1],
+                    confidence=float(assessment.get("no_action_confidence", 0.0)) if status == "no_action" else None,
+                )
+                for key in ("task_id", "actor_id", "scan_kind", "window_summary", "no_action_reason", "error"):
+                    value[key] = assessment.get(key)
+                value["normalized_event_ids"] = json.dumps(assessment.get("normalized_event_ids", []), ensure_ascii=False)
+                assessment_detections.append(value)
+            sample["qwen_window_assessments"] = fo.TemporalDetections(detections=assessment_detections)
             dataset.add_sample(sample)
             session = fo.launch_app(dataset, port=args.port, address=os.environ.get("FIFTYONE_ADDRESS", "localhost"))
             session.wait()

@@ -15,6 +15,7 @@ import numpy as np
 from common import PipelineError, load_fighter_map, load_manifest, raw_track_for_fighter, read_json, read_jsonl, write_json, write_jsonl
 from validate_events import validate
 from schema import canonicalize_event, flatten_label
+from training_contracts import validate_posec3d_payload
 
 
 def parse_args() -> argparse.Namespace:
@@ -141,6 +142,15 @@ def main() -> int:
                 canonical_lookup=has_canonical_fighters,
             )
             annotation["source_event_id"] = str(event["event_id"])
+            annotation["event_start_sec"] = float(event["start_sec"])
+            annotation["event_peak_sec"] = float(event.get("peak_sec", (float(event["start_sec"]) + float(event["end_sec"])) / 2))
+            annotation["event_end_sec"] = float(event["end_sec"])
+            annotation["event_start_frame"] = int(event.get("proxy_start_frame", round(float(event["start_sec"]) * fps)))
+            annotation["event_peak_frame"] = int(event.get("proxy_peak_frame", round(annotation["event_peak_sec"] * fps)))
+            annotation["event_end_frame"] = int(event.get("proxy_end_frame", round(float(event["end_sec"]) * fps)))
+            annotation["source_event_start_frame"] = int(event.get("source_start_frame", annotation["event_start_frame"]))
+            annotation["source_event_peak_frame"] = int(event.get("source_peak_frame", annotation["event_peak_frame"]))
+            annotation["source_event_end_frame"] = int(event.get("source_end_frame", annotation["event_end_frame"]))
             annotation["attribute_labels"] = {}
             annotation["attribute_masks"] = {}
             for name, value_map in attribute_maps.items():
@@ -154,6 +164,13 @@ def main() -> int:
                 "sample_id": sample_id, "source_event_id": event["event_id"], "label": label,
                 "actor_id": int(event["actor_id"]), "target_id": int(event.get("target_id", -1)),
                 "clip_start_sec": start, "clip_end_sec": end,
+                "event_start_sec": annotation["event_start_sec"], "event_peak_sec": annotation["event_peak_sec"],
+                "event_end_sec": annotation["event_end_sec"], "event_start_frame": annotation["event_start_frame"],
+                "event_peak_frame": annotation["event_peak_frame"], "event_end_frame": annotation["event_end_frame"],
+                "source_event_start_frame": annotation["source_event_start_frame"],
+                "source_event_peak_frame": annotation["source_event_peak_frame"],
+                "source_event_end_frame": annotation["source_event_end_frame"],
+                "proxy_fps": fps,
                 "event_type": event.get("event_type"), "action_family": event.get("action_family", "balance"), "technique": label,
                 "anatomical_side": event.get("anatomical_side"), "effector_limb": event.get("effector_limb"),
                 "effector_id": event.get("effector_id"), "stance_at_start": event.get("stance_at_start"),
@@ -199,6 +216,15 @@ def main() -> int:
         output_dir.mkdir(parents=True, exist_ok=True)
         sample_ids = [item["frame_dir"] for item in annotations]
         payload = {"split": {"train": sample_ids, "val": [], "test": []}, "annotations": annotations}
+        contract_errors = validate_posec3d_payload(payload, len(labels))
+        write_json(project / "qa" / "posec3d_contract_report.json", {
+            "ok": not contract_errors,
+            "errors": contract_errors,
+            "samples": len(annotations),
+            "contract": "MMAction2 PoseDataset: split plus annotations with [M,T,V,C] keypoint tensors",
+        })
+        if contract_errors:
+            raise PipelineError(f"PoseC3D export contract failed with {len(contract_errors)} errors")
         with output_pickle.open("wb") as handle:
             pickle.dump(payload, handle, protocol=pickle.HIGHEST_PROTOCOL)
         write_json(output_dir / "class_map.json", {

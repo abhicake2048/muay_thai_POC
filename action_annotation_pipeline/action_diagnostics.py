@@ -53,6 +53,31 @@ def _branch_summary(path: Path) -> dict[str, Any]:
     }
 
 
+def _assessment_coverage(rows: list[dict[str, Any]], expected: int, duration: float) -> dict[str, Any]:
+    by_fighter: dict[str, Any] = {}
+    for fighter in range(expected):
+        intervals = sorted(
+            (max(0.0, float(row["start_sec"])), min(duration, float(row["end_sec"])))
+            for row in rows
+            if int(row.get("actor_id", -1)) == fighter and row.get("status") in {"action", "no_action"}
+        )
+        merged: list[list[float]] = []
+        for start, end in intervals:
+            if end <= start:
+                continue
+            if not merged or start > merged[-1][1] + 1e-6:
+                merged.append([start, end])
+            else:
+                merged[-1][1] = max(merged[-1][1], end)
+        seconds = sum(end - start for start, end in merged)
+        by_fighter[str(fighter)] = {
+            "covered_sec": round(seconds, 6),
+            "coverage_ratio": round(seconds / max(duration, 1e-6), 6),
+            "intervals": merged,
+        }
+    return by_fighter
+
+
 def build_report(project: Path, expected_classifier: str = "auto") -> dict[str, Any]:
     manifest = load_manifest(project)
     fighter_map = load_fighter_map(project)
@@ -70,7 +95,10 @@ def build_report(project: Path, expected_classifier: str = "auto") -> dict[str, 
     )
     tracks = _rows(project / "tracks" / "tracks.jsonl")
     detection_counts = [len(row.get("detections", [])) for row in tracks]
-    branch_paths = sorted((project / "proposals" / "branches").glob("*.jsonl"))
+    branch_paths = [
+        path for path in sorted((project / "proposals" / "branches").glob("*.jsonl"))
+        if path.stem != "qwen_window_assessments"
+    ]
     branches = {path.stem: _branch_summary(path) for path in branch_paths}
     fused = _rows(project / "proposals" / "fused_proposals.jsonl")
     classified = [row for row in fused if str(row.get("technique", "unknown_action")) != "unknown_action"]
@@ -97,10 +125,6 @@ def build_report(project: Path, expected_classifier: str = "auto") -> dict[str, 
         message = "no fused action proposals were produced"
         warnings.append(message)
         critical.append(message)
-    elif fused_peaks and max(fused_peaks) < coverage["pose_end_sec"] - 1.0:
-        message = "proposals stop before the pose timeline ends"
-        warnings.append(message)
-        critical.append(message)
     classifier_expected = expected_classifier in {"hybrid", "required"}
     if classifier_expected and fused and not classified:
         warnings.append("all proposals are unknown_action; no successful technique classifier output was fused")
@@ -109,10 +133,19 @@ def build_report(project: Path, expected_classifier: str = "auto") -> dict[str, 
         warnings.append("no technique-classifier branch ran; pose actionness can only suggest family/limb")
     qwen_summary_path = project / "proposals" / "raw" / "qwen" / "summary.json"
     qwen_summary = read_json(qwen_summary_path) if qwen_summary_path.is_file() else None
+    qwen_assessments_path = project / "proposals" / "branches" / "qwen_window_assessments.jsonl"
+    qwen_assessments = _rows(qwen_assessments_path)
+    assessment_coverage = _assessment_coverage(
+        qwen_assessments, expected, float(manifest["proxy_video"]["duration_sec"])
+    )
     qwen_relevant = expected_classifier in {"hybrid", "required"} or (
         expected_classifier == "auto" and bool(classifier_branches)
     )
     if qwen_relevant and qwen_summary and int(qwen_summary.get("tasks", 0)) > 0:
+        if qwen_summary.get("window_assessments") and len(qwen_assessments) != int(qwen_summary.get("tasks", 0)):
+            message = "Qwen window audit count does not match the number of processed tasks"
+            warnings.append(message)
+            critical.append(message)
         if int(qwen_summary.get("events", 0)) == 0:
             message = "Qwen processed windows but produced zero normalized action events"
             warnings.append(message)
@@ -122,6 +155,13 @@ def build_report(project: Path, expected_classifier: str = "auto") -> dict[str, 
             warnings.append(
                 f"Qwen failed on {int(qwen_summary['failures'])}/{int(qwen_summary.get('tasks', 0))} tasks"
             )
+        if qwen_summary.get("scan_mode") in {"hybrid", "dense"}:
+            incomplete = [fighter for fighter, value in assessment_coverage.items() if value["coverage_ratio"] < 0.98]
+            if incomplete:
+                message = f"Qwen did not successfully assess the full video for fighters: {', '.join(incomplete)}"
+                warnings.append(message)
+                critical.append(message)
+                recommendations.append("Inspect failed Qwen windows, fighter crop coverage, and qwen_window_assessments.jsonl, then rerun hybrid actions.")
     if classifier_expected and unresolved:
         warnings.append(
             f"{len(unresolved)} motion candidates remain unclassified and are isolated from classified actions"
@@ -174,7 +214,12 @@ def build_report(project: Path, expected_classifier: str = "auto") -> dict[str, 
             "classified_output": str(project / "proposals" / "classified_actions.jsonl"),
             "unresolved_output": str(project / "proposals" / "unresolved_motion.jsonl"),
         },
-        "qwen": qwen_summary if qwen_relevant else {"ignored_stale_summary_in_pose_mode": bool(qwen_summary)},
+        "qwen": ({
+            **(qwen_summary or {}),
+            "assessment_rows": len(qwen_assessments),
+            "assessment_statuses": dict(Counter(str(row.get("status", "unknown")) for row in qwen_assessments)),
+            "successful_temporal_coverage": assessment_coverage,
+        } if qwen_relevant else {"ignored_stale_summary_in_pose_mode": bool(qwen_summary)}),
         "pose_actionness": pose_report,
         "warnings": warnings,
         "critical_failures": critical,

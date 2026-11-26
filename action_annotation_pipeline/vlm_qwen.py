@@ -31,12 +31,19 @@ Find ZERO OR MORE committed actions by fighter {actor_id}. Include combinations 
 Use the fighter's anatomical left/right, never screen-left/screen-right. Use unknown when hidden.
 Allowed techniques: {techniques}.
 Return exactly one JSON object and no prose:
-{{"events":[{{"start_offset_sec":0.0,"peak_offset_sec":0.0,"end_offset_sec":0.0,
+{{"contains_action":true,"window_summary":"Actor throws one visible lead-hand punch.","events":[{{"start_offset_sec":0.2,"peak_offset_sec":0.45,"end_offset_sec":0.75,
 "technique":"jab","technique_candidates":[{{"technique":"jab","confidence":0.7}}],
 "anatomical_side":"left","effector_limb":"hand","stance_at_start":"orthodox",
 "stance_role":"lead","target_zone":"head","outcome":"attempted","contact_surface":"fist",
-"visibility":"visible","confidence":0.7,"uncertainty_flags":[]}}],"no_action_confidence":0.0}}
+"visibility":"visible","confidence":0.7,"uncertainty_flags":[],
+"classification_reason":"Lead hand extends toward the opponent's head and retracts.",
+"boundary_reason":"Starts at extension onset, peaks at maximum reach, ends after retraction.",
+"visual_evidence":["lead wrist advances toward opponent head","elbow extends then flexes"]}}],
+"no_action_confidence":0.0,"no_action_reason":""}}
 Offsets are relative to the start of this window, in seconds. Boundaries must be ordered and inside the window.
+If no committed action occurs, return contains_action=false, events=[], a confidence from 0 to 1,
+and a concise no_action_reason describing the observable normal movement. Never omit the window assessment.
+Reasons must cite short observable visual evidence, not hidden reasoning or speculation.
 Do not invent contact or anatomical side. Predictions are proposals, not verified truth."""
 
 TECHNIQUE_ALIASES = {
@@ -71,6 +78,94 @@ def _json_object(text: str) -> dict[str, Any]:
         return value
     detail = f" ({errors[-1]})" if errors else ""
     raise ValueError(f"model output contained no valid JSON object{detail}")
+
+
+def _finite_number(value: Any, name: str) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be a number") from exc
+    if not np.isfinite(number):
+        raise ValueError(f"{name} must be finite")
+    return number
+
+
+def validate_vlm_payload(
+    payload: dict[str, Any],
+    window_duration: float,
+    allowed_techniques: set[str],
+    schema: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Validate the semantic VLM contract, not merely JSON syntax."""
+    events = payload.get("events")
+    if not isinstance(events, list):
+        raise ValueError("events must be an array")
+    contains_action = payload.get("contains_action")
+    if not isinstance(contains_action, bool):
+        raise ValueError("contains_action must be true or false")
+    if contains_action != bool(events):
+        raise ValueError("contains_action must be true exactly when events is non-empty")
+    if not str(payload.get("window_summary", "")).strip():
+        raise ValueError("window_summary must be a non-empty observable summary")
+    no_action_confidence = _finite_number(payload.get("no_action_confidence", 0.0), "no_action_confidence")
+    if not 0.0 <= no_action_confidence <= 1.0:
+        raise ValueError("no_action_confidence must be between 0 and 1")
+    if not events and not str(payload.get("no_action_reason", "")).strip():
+        raise ValueError("no_action_reason is required when events is empty")
+    for index, event in enumerate(events):
+        if not isinstance(event, dict):
+            raise ValueError(f"events[{index}] must be an object")
+        start = _finite_number(event.get("start_offset_sec"), f"events[{index}].start_offset_sec")
+        peak = _finite_number(event.get("peak_offset_sec"), f"events[{index}].peak_offset_sec")
+        end = _finite_number(event.get("end_offset_sec"), f"events[{index}].end_offset_sec")
+        if not (0.0 <= start <= peak <= end <= window_duration + 1e-6):
+            raise ValueError(f"events[{index}] boundaries must satisfy 0 <= start <= peak <= end <= window duration")
+        if end - start < 0.03:
+            raise ValueError(f"events[{index}] is shorter than 0.03 seconds")
+        confidence = _finite_number(event.get("confidence"), f"events[{index}].confidence")
+        if not 0.0 <= confidence <= 1.0:
+            raise ValueError(f"events[{index}].confidence must be between 0 and 1")
+        technique = _normalize_technique(event.get("technique"))
+        if technique not in allowed_techniques:
+            raise ValueError(f"events[{index}].technique is not in the allowed taxonomy: {technique}")
+        candidates = event.get("technique_candidates")
+        if not isinstance(candidates, list) or not candidates:
+            raise ValueError(f"events[{index}].technique_candidates must be a non-empty array")
+        for candidate_index, candidate in enumerate(candidates[:3]):
+            if not isinstance(candidate, dict):
+                raise ValueError(f"events[{index}].technique_candidates[{candidate_index}] must be an object")
+            candidate_label = _normalize_technique(candidate.get("technique"))
+            if candidate_label not in allowed_techniques:
+                raise ValueError(f"events[{index}] has an invalid technique candidate: {candidate_label}")
+            candidate_confidence = _finite_number(
+                candidate.get("confidence"), f"events[{index}].technique_candidates[{candidate_index}].confidence"
+            )
+            if not 0.0 <= candidate_confidence <= 1.0:
+                raise ValueError(f"events[{index}] technique candidate confidence must be between 0 and 1")
+        if schema:
+            categorical = {
+                "anatomical_side": "anatomical_sides",
+                "effector_limb": "effector_limbs",
+                "stance_at_start": "stance_classes",
+                "stance_role": "stance_roles",
+                "target_zone": "target_zones",
+                "outcome": "outcomes",
+                "contact_surface": "contact_surfaces",
+                "visibility": "visibility_levels",
+            }
+            for field, schema_field in categorical.items():
+                if event.get(field) not in schema.get(schema_field, []):
+                    raise ValueError(f"events[{index}].{field} is missing or outside the schema")
+        if not isinstance(event.get("uncertainty_flags"), list):
+            raise ValueError(f"events[{index}].uncertainty_flags must be an array")
+        if not str(event.get("classification_reason", "")).strip():
+            raise ValueError(f"events[{index}].classification_reason is required")
+        if not str(event.get("boundary_reason", "")).strip():
+            raise ValueError(f"events[{index}].boundary_reason is required")
+        evidence = event.get("visual_evidence")
+        if not isinstance(evidence, list) or not any(str(item).strip() for item in evidence):
+            raise ValueError(f"events[{index}].visual_evidence must contain at least one observation")
+    return payload
 
 
 def _letterbox(frame: np.ndarray, width: int, height: int) -> np.ndarray:
@@ -359,6 +454,13 @@ def normalize_events(
             "proposal_branch": "qwen_actions",
             "proposal_confidence": round(confidence, 6),
             "attribute_confidence": round(confidence, 6),
+            "classification_reason": str(prediction.get("classification_reason", "")).strip(),
+            "boundary_reason": str(prediction.get("boundary_reason", "")).strip(),
+            "visual_evidence": [
+                str(item).strip() for item in prediction.get("visual_evidence", [])
+                if str(item).strip()
+            ],
+            "window_summary": str(payload.get("window_summary", "")).strip(),
             "annotation_revision": 1,
             "provenance": {
                 "source": "qwen_actions", "task_id": task["task_id"], "scan_kind": task["kind"],
@@ -385,6 +487,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--vision-mode", choices=("video", "frames"), default="video")
     parser.add_argument("--minimum-actor-crop-coverage", type=float, default=0.60)
     parser.add_argument("--debug-previews", type=int, default=12)
+    parser.add_argument("--max-new-tokens", type=int, default=1536)
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args()
 
@@ -440,8 +543,8 @@ def main() -> int:
         model_path = args.model.expanduser().resolve()
         if not model_path.is_dir():
             raise PipelineError(f"Local Qwen model directory not found: {model_path}")
-        if args.window_seconds <= 0 or args.hop_seconds <= 0 or args.fps <= 0:
-            raise PipelineError("window, hop and FPS must be positive")
+        if args.window_seconds <= 0 or args.hop_seconds <= 0 or args.fps <= 0 or args.max_new_tokens <= 0:
+            raise PipelineError("window, hop, FPS and max-new-tokens must be positive")
         if not 0.0 <= args.minimum_actor_crop_coverage <= 1.0:
             raise PipelineError("--minimum-actor-crop-coverage must be between 0 and 1")
         source_path = args.input.expanduser().resolve() if args.input else project / "proposals" / "branches" / "pose_attributes.jsonl"
@@ -482,6 +585,7 @@ def main() -> int:
         preview_dir = raw_dir / "previews"
         preview_dir.mkdir(parents=True, exist_ok=True)
         outputs: list[dict[str, Any]] = []
+        assessments: list[dict[str, Any]] = []
         failures = 0
         parse_failures = 0
         crop_failures = 0
@@ -500,14 +604,28 @@ def main() -> int:
                 "frame_count": len(images),
                 "crop_stats": crop_stats,
             }
+            assessment = {
+                "task_id": task["task_id"],
+                "scan_kind": task["kind"],
+                "actor_id": int(task["actor_id"]),
+                "start_sec": float(task["start_sec"]),
+                "end_sec": float(task["end_sec"]),
+                "source_event_ids": list(task.get("source_event_ids", [])),
+                "crop_stats": crop_stats,
+                "raw_record": f"proposals/raw/qwen/{task['task_id']}.json",
+            }
             if not images:
                 record["error"] = "no actor-targeted frames decoded"
+                assessment.update({"status": "failed", "error": record["error"], "contains_action": None})
+                assessments.append(assessment)
                 failures += 1
                 crop_failures += 1
                 write_json(raw_dir / f"{task['task_id']}.json", record)
                 continue
             if float(crop_stats["actor_crop_coverage"]) < args.minimum_actor_crop_coverage:
                 record["error"] = "insufficient_actor_crop_coverage"
+                assessment.update({"status": "failed", "error": record["error"], "contains_action": None})
+                assessments.append(assessment)
                 failures += 1
                 crop_failures += 1
                 write_json(raw_dir / f"{task['task_id']}.json", record)
@@ -531,12 +649,14 @@ def main() -> int:
             payload: dict[str, Any] | None = None
             parse_error = ""
             input_errors: list[str] = []
+            prompt_history: list[str] = []
             mode_used = args.vision_mode
             for attempt in range(2):
                 prompt = base_prompt if attempt == 0 else (
                     base_prompt + f"\nYour previous response could not be parsed ({parse_error}). "
                     "Return only one corrected JSON object beginning with { and ending with }."
                 )
+                prompt_history.append(prompt)
                 try:
                     inputs, mode_used = _model_inputs(processor, images, prompt, args.vision_mode, args.fps)
                 except Exception as exc:
@@ -547,18 +667,26 @@ def main() -> int:
                 inputs = {key: value.to(model.device) if hasattr(value, "to") else value for key, value in inputs.items()}
                 model_calls += 1
                 with torch.inference_mode():
-                    generated = model.generate(**inputs, max_new_tokens=768, do_sample=False)
+                    generated = model.generate(**inputs, max_new_tokens=args.max_new_tokens, do_sample=False)
                 trimmed = generated[:, inputs["input_ids"].shape[1]:]
                 raw = processor.batch_decode(trimmed, skip_special_tokens=True)[0]
                 try:
                     payload = _json_object(raw)
+                    validate_vlm_payload(
+                        payload,
+                        float(task["end_sec"]) - float(task["start_sec"]),
+                        set(schema["primary_action_classes"]),
+                        schema,
+                    )
                     parse_error = ""
                     break
                 except (ValueError, json.JSONDecodeError) as exc:
                     parse_error = str(exc)
+                    payload = None
             used_modes[mode_used] = used_modes.get(mode_used, 0) + 1
             record.update({
                 "raw_output": raw,
+                "prompt_history": prompt_history,
                 "parse_error": parse_error,
                 "input_warnings": input_errors,
                 "vision_mode": mode_used,
@@ -567,18 +695,34 @@ def main() -> int:
             if payload is None:
                 failures += 1
                 parse_failures += 1
+                assessment.update({
+                    "status": "failed", "error": parse_error or "invalid model output",
+                    "contains_action": None, "vision_mode": mode_used,
+                })
             else:
                 events = normalize_events(payload, task, manifest, schema)
                 if not events:
                     valid_zero_event_tasks += 1
                 record["normalized_event_ids"] = [event["event_id"] for event in events]
+                assessment.update({
+                    "status": "action" if events else "no_action",
+                    "contains_action": bool(events),
+                    "window_summary": str(payload.get("window_summary", "")).strip(),
+                    "no_action_confidence": float(payload.get("no_action_confidence", 0.0)),
+                    "no_action_reason": str(payload.get("no_action_reason", "")).strip(),
+                    "normalized_event_ids": [event["event_id"] for event in events],
+                    "vision_mode": mode_used,
+                })
                 outputs.extend(events)
+            assessments.append(assessment)
             write_json(raw_dir / f"{task['task_id']}.json", record)
             if task_index % 10 == 0:
                 print(f"Qwen action scan {task_index}/{len(tasks)}; events={len(outputs)} failures={failures}", flush=True)
 
         outputs.sort(key=lambda row: (float(row["start_sec"]), int(row["actor_id"]), float(row["peak_sec"])))
         write_jsonl(output, outputs)
+        assessments_output = project / "proposals" / "branches" / "qwen_window_assessments.jsonl"
+        write_jsonl(assessments_output, assessments)
         summary = {
             "tasks": len(tasks),
             "events": len(outputs),
@@ -586,12 +730,17 @@ def main() -> int:
             "parse_failures": parse_failures,
             "insufficient_actor_crop_tasks": crop_failures,
             "valid_zero_event_tasks": valid_zero_event_tasks,
+            "action_windows": sum(item.get("status") == "action" for item in assessments),
+            "no_action_windows": sum(item.get("status") == "no_action" for item in assessments),
+            "failed_windows": sum(item.get("status") == "failed" for item in assessments),
             "model_calls": model_calls,
             "vision_modes": used_modes,
             "debug_previews": previews_written,
             "scan_mode": args.scan_mode,
             "model": str(model_path),
             "local_only": True,
+            "max_new_tokens": args.max_new_tokens,
+            "window_assessments": str(assessments_output),
         }
         write_json(raw_dir / "summary.json", summary)
         print(json.dumps({**summary, "output": str(output), "raw_dir": str(raw_dir)}, indent=2))

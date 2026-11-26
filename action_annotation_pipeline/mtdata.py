@@ -180,6 +180,7 @@ def _run_action_stages(
             raise PipelineError("hybrid action mode requires --vlm-model")
         model_path = vlm_model.expanduser().resolve()
         qwen = project / "proposals" / "branches" / "qwen_actions.jsonl"
+        qwen_assessments = project / "proposals" / "branches" / "qwen_window_assessments.jsonl"
         qwen_summary = project / "proposals" / "raw" / "qwen" / "summary.json"
         vlm_args = [
             "--project", str(project), "--model", str(model_path), "--device", device,
@@ -194,7 +195,7 @@ def _run_action_stages(
             "vlm_qwen.py",
             vlm_args,
             [proxy, tracks, fighter_map, attributes, model_path],
-            [qwen, qwen_summary],
+            [qwen, qwen_assessments, qwen_summary],
             overwrite,
         )
         branches.append(qwen)

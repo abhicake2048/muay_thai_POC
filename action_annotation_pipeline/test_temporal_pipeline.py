@@ -215,6 +215,12 @@ class TemporalPipelineTests(unittest.TestCase):
                 self.assertEqual(export_tridet_main(), 0)
             self.assertTrue((project / "exports" / "posec3d" / "posec3d_annotations.pkl").is_file())
             self.assertTrue((project / "exports" / "tridet" / "annotations.json").is_file())
+            tridet = json.loads((project / "exports" / "tridet" / "annotations.json").read_text(encoding="utf-8"))
+            annotation = tridet["database"]["test__fighter0"]["annotations"][0]
+            self.assertEqual(annotation["label_id"], tridet["label_to_id"]["jab"])
+            self.assertEqual(tridet["database"]["test__fighter0"]["fps"], 10.0)
+            self.assertTrue((project / "qa" / "posec3d_contract_report.json").is_file())
+            self.assertTrue((project / "qa" / "tridet_contract_report.json").is_file())
 
     def test_pose_diagnostics_ignore_stale_empty_qwen_run(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
