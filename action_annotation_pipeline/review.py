@@ -9,8 +9,85 @@ import shutil
 import sys
 from pathlib import Path
 
-from common import PipelineError, load_manifest, read_json, read_jsonl, write_json
+from common import PipelineError, load_manifest, read_json, read_jsonl, write_json, write_jsonl
 from schema import canonicalize_event
+
+
+def _field(label: object, key: str, default=None):
+    try:
+        value = label.get_field(key)  # type: ignore[attr-defined]
+        return default if value is None else value
+    except (AttributeError, KeyError, ValueError):
+        try:
+            value = label[key]  # type: ignore[index]
+            return default if value is None else value
+        except (KeyError, TypeError):
+            return default
+
+
+def fiftyone_detections_to_events(detections: list[object], fps: float, schema: dict) -> list[dict]:
+    """Convert saved FiftyOne temporal labels into sync-review JSONL rows."""
+    rows: list[dict] = []
+    review_labels = {"reviewed": "review_range"}
+    ignore_labels = {"unreviewed", "unusable", "camera_cut", "replay"}
+    for index, detection in enumerate(detections, start=1):
+        label = str(getattr(detection, "label", _field(detection, "label", "")))
+        support = list(getattr(detection, "support", _field(detection, "support", [])) or [])
+        if len(support) != 2:
+            raise PipelineError(f"FiftyOne temporal label {index} has invalid support")
+        start_frame, end_frame = int(support[0]) - 1, int(support[1]) - 1
+        start_sec, end_sec = start_frame / fps, end_frame / fps
+        event_type = str(_field(detection, "event_type", ""))
+        if label in review_labels:
+            event_type = review_labels[label]
+        elif label in ignore_labels:
+            event_type = "ignore"
+        elif not event_type:
+            event_type = "action"
+        peak_frame = int(_field(detection, "proxy_peak_frame", round((start_frame + end_frame) / 2)))
+        row = {
+            "event_id": str(_field(detection, "event_id", f"fiftyone_{index:06d}")),
+            "event_type": event_type,
+            "actor_id": int(_field(detection, "actor_id", -1)),
+            "target_id": int(_field(detection, "target_id", -1)),
+            "start_sec": round(start_sec, 6), "peak_sec": round(peak_frame / fps, 6), "end_sec": round(end_sec, 6),
+            "proxy_fps": fps, "proxy_start_frame": start_frame, "proxy_peak_frame": peak_frame, "proxy_end_frame": end_frame,
+            "label": label, "technique": label,
+            "anatomical_side": _field(detection, "anatomical_side", "unknown"),
+            "effector_limb": _field(detection, "effector_limb", "unknown"),
+            "stance_at_start": _field(detection, "stance_at_start", "unknown"),
+            "stance_role": _field(detection, "stance_role", "unknown"),
+            "target_zone": _field(detection, "target_zone", "unknown"),
+            "outcome": _field(detection, "outcome", "uncertain"),
+            "contact_surface": _field(detection, "contact_surface", "unknown"),
+            "visibility": _field(detection, "visibility", "unknown"),
+            "review_status": _field(detection, "review_status", "verified" if event_type in {"review_range", "ignore"} else "proposed"),
+            "annotator": _field(detection, "annotator", "fiftyone_reviewer"),
+            "classification_reason": _field(detection, "classification_reason", ""),
+            "boundary_reason": _field(detection, "boundary_reason", ""),
+            "window_summary": _field(detection, "window_summary", ""),
+            "combo_id": _field(detection, "combo_id"),
+            "counter_to_event_id": _field(detection, "counter_to_event_id"),
+            "possible_cause": _field(detection, "possible_cause"),
+            "round": int(_field(detection, "round", 0)),
+            "notes": _field(detection, "notes", ""),
+            "source": "fiftyone_review",
+            "annotation_revision": int(_field(detection, "annotation_revision", 0)) + 1,
+            "provenance": {"source": "fiftyone_review", "imported_event_id": _field(detection, "event_id")},
+        }
+        for field in ("technique_candidates", "branch_evidence", "visual_evidence", "uncertainty_flags"):
+            value = _field(detection, field, [])
+            if isinstance(value, str):
+                try:
+                    value = json.loads(value)
+                except json.JSONDecodeError:
+                    value = []
+            row[field] = value if isinstance(value, list) else []
+        if event_type in {"review_range", "ignore"}:
+            row["actor_id"] = -1
+            row["target_id"] = -1
+        rows.append(canonicalize_event(row, schema))
+    return sorted(rows, key=lambda item: (float(item["start_sec"]), int(item.get("actor_id", -1))))
 
 
 def cvat_contract(schema: dict) -> dict:
@@ -81,11 +158,12 @@ def main() -> int:
                     support=[int(round(float(event["start_sec"]) * fps)) + 1, int(round(float(event["end_sec"]) * fps)) + 1],
                     confidence=float(event.get("proposal_confidence", 0.0)),
                 )
-                for key in ("event_id", "actor_id", "target_id", "anatomical_side", "effector_limb", "effector_id", "stance_at_start", "stance_role", "target_zone", "outcome", "contact_surface", "visibility", "review_status", "proxy_start_frame", "proxy_peak_frame", "proxy_end_frame", "classification_reason", "boundary_reason", "window_summary"):
+                for key in ("event_id", "event_type", "actor_id", "target_id", "anatomical_side", "effector_limb", "effector_id", "stance_at_start", "stance_role", "target_zone", "outcome", "contact_surface", "visibility", "review_status", "annotator", "annotation_revision", "proxy_start_frame", "proxy_peak_frame", "proxy_end_frame", "classification_reason", "boundary_reason", "window_summary", "combo_id", "counter_to_event_id", "possible_cause", "round", "notes"):
                     detection[key] = event.get(key)
                 detection["technique_candidates"] = json.dumps(event.get("technique_candidates", []), ensure_ascii=False)
                 detection["branch_evidence"] = json.dumps(event.get("branch_evidence", []), ensure_ascii=False)
                 detection["visual_evidence"] = json.dumps(event.get("visual_evidence", []), ensure_ascii=False)
+                detection["uncertainty_flags"] = json.dumps(event.get("uncertainty_flags", []), ensure_ascii=False)
                 detections.append(detection)
             sample["action_proposals"] = fo.TemporalDetections(detections=detections)
             assessment_detections = []
@@ -104,6 +182,16 @@ def main() -> int:
             dataset.add_sample(sample)
             session = fo.launch_app(dataset, port=args.port, address=os.environ.get("FIFTYONE_ADDRESS", "localhost"))
             session.wait()
+            dataset.save()
+            refreshed = dataset.first()
+            reviewed_field = refreshed.get_field("action_proposals")
+            reviewed_detections = list(reviewed_field.detections or []) if reviewed_field is not None else []
+            reviewed_rows = fiftyone_detections_to_events(reviewed_detections, fps, schema)
+            reviewed_output = project / "review" / "fiftyone_reviewed_events.jsonl"
+            write_jsonl(reviewed_output, reviewed_rows)
+            review_manifest["fiftyone_reviewed_events"] = str(reviewed_output)
+            review_manifest["fiftyone_reviewed_event_count"] = len(reviewed_rows)
+            write_json(project / "review" / "review_manifest.json", review_manifest)
         print(json.dumps(review_manifest, indent=2))
         return 0
     except (OSError, ValueError, PipelineError) as exc:

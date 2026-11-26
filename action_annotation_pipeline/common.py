@@ -139,6 +139,31 @@ def merge_intervals(intervals: Iterable[tuple[float, float]]) -> list[tuple[floa
     return [(start, end) for start, end in merged]
 
 
+def subtract_intervals(
+    include: Iterable[tuple[float, float]],
+    exclude: Iterable[tuple[float, float]],
+    minimum_duration: float = 1e-3,
+) -> list[tuple[float, float]]:
+    """Return included time with excluded intervals removed."""
+    result: list[tuple[float, float]] = []
+    exclusions = merge_intervals(exclude)
+    for include_start, include_end in merge_intervals(include):
+        pieces = [(include_start, include_end)]
+        for exclude_start, exclude_end in exclusions:
+            updated: list[tuple[float, float]] = []
+            for start, end in pieces:
+                if exclude_end <= start or exclude_start >= end:
+                    updated.append((start, end))
+                else:
+                    if exclude_start > start:
+                        updated.append((start, min(end, exclude_start)))
+                    if exclude_end < end:
+                        updated.append((max(start, exclude_end), end))
+            pieces = updated
+        result.extend((start, end) for start, end in pieces if end - start >= minimum_duration)
+    return result
+
+
 def interval_covered(start: float, end: float, coverage: Iterable[tuple[float, float]], tolerance: float = 0.05) -> bool:
     return any(a - tolerance <= start and end <= b + tolerance for a, b in coverage)
 

@@ -28,6 +28,8 @@ PROMPT = """You are proposing Muay Thai temporal annotations for human review.
 The ordered composite frames cover {window_start:.3f} to {window_end:.3f} seconds at {fps:.1f} FPS.
 Each frame shows the full scene above, acting fighter {actor_id} below-left, and the opponent below-right.
 Find ZERO OR MORE committed actions by fighter {actor_id}. Include combinations as separate events.
+Include discrete attacks, defenses, clinch changes, and balance events represented by the allowed taxonomy;
+do not label ordinary guard holding, circling, feints, or stance adjustment as a committed action.
 Use the fighter's anatomical left/right, never screen-left/screen-right. Use unknown when hidden.
 Allowed techniques: {techniques}.
 Return exactly one JSON object and no prose:
@@ -251,12 +253,8 @@ def _composite_frames(
                 continue
             decoded_frames += 1
             boxes = _boxes_for_time(tracks_by_frame, fighter_map, float(timestamp), video_fps)
-            if actor_id not in boxes:
-                # Never let the full scene silently masquerade as the actor
-                # crop. Such windows generated confident labels for the wrong
-                # fighter and many valid-looking zero-action responses.
-                continue
-            actor_box_frames += 1
+            if actor_id in boxes:
+                actor_box_frames += 1
             scene = frame.copy()
             for fighter, box in boxes.items():
                 color = (60, 210, 150) if fighter == actor_id else (60, 150, 250)
@@ -270,6 +268,10 @@ def _composite_frames(
             composite = np.zeros((448, 448, 3), dtype=np.uint8)
             composite[:252] = _letterbox(scene, 448, 252)
             composite[252:] = np.concatenate([
+                # A missing actor remains a black crop at its original
+                # timestamp. Dropping the whole frame would compress time and
+                # make model offsets disagree with proxy frames. The window is
+                # still rejected below when crop coverage is insufficient.
                 _letterbox(_crop(frame, boxes.get(actor_id)), 224, 196),
                 _letterbox(_crop(frame, boxes.get(opponent_id)), 224, 196),
             ], axis=1)
@@ -385,7 +387,7 @@ def normalize_events(
     manifest: dict[str, Any],
     schema: dict[str, Any],
 ) -> list[dict[str, Any]]:
-    allowed_techniques = set(schema.get("primary_action_classes", []))
+    allowed_techniques = set(schema.get("trainable_event_classes", schema.get("primary_action_classes", [])))
     allowed_sides = set(schema.get("anatomical_sides", []))
     allowed_limbs = set(schema.get("effector_limbs", []))
     window_start, window_end = float(task["start_sec"]), float(task["end_sec"])
@@ -409,7 +411,7 @@ def normalize_events(
         if side not in allowed_sides:
             side = "unknown"
         family = technique_family(schema, technique) or str(prediction.get("action_family", "unknown"))
-        if family not in schema.get("action_families", {}):
+        if family not in {*schema.get("action_families", {}), "balance"}:
             family = "unknown"
         limb = str(prediction.get("effector_limb", DEFAULT_LIMB.get(family, "unknown")))
         if limb not in allowed_limbs:
@@ -422,9 +424,9 @@ def normalize_events(
             "event_id": event_id,
             "source_event_id": source.get("event_id") if isinstance(source, dict) else None,
             "video_id": manifest["video_id"],
-            "event_type": "action",
+            "event_type": "balance" if family == "balance" else "action",
             "actor_id": int(task["actor_id"]),
-            "target_id": 1 - int(task["actor_id"]) if int(task["actor_id"]) in (0, 1) else -1,
+            "target_id": -1 if family == "balance" else (1 - int(task["actor_id"]) if int(task["actor_id"]) in (0, 1) else -1),
             "start_sec": round(window_start + start_offset, 6),
             "peak_sec": round(window_start + peak_offset, 6),
             "end_sec": round(window_start + end_offset, 6),
@@ -579,7 +581,8 @@ def main() -> int:
         if not args.device.startswith("cuda"):
             model = model.to(args.device)
 
-        techniques = ", ".join(schema["primary_action_classes"])
+        allowed_techniques = set(schema.get("trainable_event_classes", schema["primary_action_classes"]))
+        techniques = ", ".join(schema.get("trainable_event_classes", schema["primary_action_classes"]))
         raw_dir = project / "proposals" / "raw" / "qwen"
         raw_dir.mkdir(parents=True, exist_ok=True)
         preview_dir = raw_dir / "previews"
@@ -675,7 +678,7 @@ def main() -> int:
                     validate_vlm_payload(
                         payload,
                         float(task["end_sec"]) - float(task["start_sec"]),
-                        set(schema["primary_action_classes"]),
+                        allowed_techniques,
                         schema,
                     )
                     parse_error = ""

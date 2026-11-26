@@ -12,7 +12,7 @@ from typing import Any
 
 import numpy as np
 
-from common import PipelineError, load_fighter_map, load_manifest, raw_track_for_fighter, read_json, read_jsonl, write_json, write_jsonl
+from common import PipelineError, load_fighter_map, load_manifest, raw_track_for_fighter, read_json, read_jsonl, subtract_intervals, write_json, write_jsonl
 from validate_events import validate
 from schema import canonicalize_event, flatten_label
 from training_contracts import validate_posec3d_payload
@@ -122,6 +122,9 @@ def main() -> int:
             canonicalize_event(event, schema) for event in events
             if event.get("event_type") in {"action", "balance"} and event.get("review_status") == "verified"
         ]
+        review_ranges = [(float(e["start_sec"]), float(e["end_sec"])) for e in events if e.get("event_type") == "review_range" and e.get("review_status") == "verified"]
+        ignore_ranges = [(float(e["start_sec"]), float(e["end_sec"])) for e in events if e.get("event_type") == "ignore" and e.get("review_status") in ("verified", "uncertain")]
+        trainable_ranges = subtract_intervals(review_ranges, ignore_ranges)
         attribute_values = {
             "anatomical_side": list(schema["anatomical_sides"]),
             "stance_role": list(schema["stance_roles"]),
@@ -132,8 +135,14 @@ def main() -> int:
         annotations: list[dict[str, Any]] = []
         metadata_rows: list[dict[str, Any]] = []
         for event in verified_actions:
-            start = max(0.0, float(event["start_sec"]) - args.context_before)
-            end = min(duration, float(event["end_sec"]) + args.context_after)
+            containing_range = next((
+                (range_start, range_end) for range_start, range_end in trainable_ranges
+                if range_start - 1e-6 <= float(event["start_sec"]) and float(event["end_sec"]) <= range_end + 1e-6
+            ), None)
+            if containing_range is None:
+                raise PipelineError(f"Verified event {event['event_id']} is not inside a reviewed, non-ignored range")
+            start = max(containing_range[0], float(event["start_sec"]) - args.context_before)
+            end = min(containing_range[1], float(event["end_sec"]) + args.context_after)
             label = str(event.get("technique") or event["label"])
             sample_id = f"{manifest['video_id']}__{event['event_id']}__actor{event['actor_id']}"
             annotation = make_annotation(
@@ -181,8 +190,7 @@ def main() -> int:
             })
 
         desired_background = int(round(len(annotations) * max(0.0, args.background_ratio)))
-        review_ranges = [(float(e["start_sec"]), float(e["end_sec"])) for e in events if e.get("event_type") == "review_range" and e.get("review_status") == "verified"]
-        excluded = [(float(e["start_sec"]), float(e["end_sec"])) for e in events if e.get("event_type") in ("action", "ignore") and e.get("review_status") in ("verified", "uncertain")]
+        excluded = [(float(e["start_sec"]), float(e["end_sec"])) for e in events if e.get("event_type") in ("action", "balance", "ignore") and e.get("review_status") in ("verified", "uncertain")]
         candidates: list[tuple[float, float]] = []
         step = max(0.25, args.background_window / 2)
         for range_start, range_end in review_ranges:

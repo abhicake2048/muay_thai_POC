@@ -44,6 +44,7 @@ def validate_posec3d_payload(payload: dict[str, Any], class_count: int) -> list[
             shape = annotation.get(shape_key)
             if not isinstance(shape, (tuple, list)) or len(shape) != 2:
                 errors.append(f"{prefix}.{shape_key} must be [height,width]")
+    split_membership: dict[str, str] = {}
     for split_name, values in splits.items():
         if not isinstance(values, list):
             errors.append(f"split.{split_name} must be an array")
@@ -51,6 +52,10 @@ def validate_posec3d_payload(payload: dict[str, Any], class_count: int) -> list[
         missing = set(map(str, values)) - sample_ids
         if missing:
             errors.append(f"split.{split_name} references unknown samples: {sorted(missing)[:3]}")
+        for sample_id in map(str, values):
+            if sample_id in split_membership:
+                errors.append(f"PoseC3D sample {sample_id} appears in both {split_membership[sample_id]} and {split_name}")
+            split_membership[sample_id] = split_name
     return errors
 
 
@@ -64,6 +69,8 @@ def validate_tridet_payload(payload: dict[str, Any], require_training_subset: bo
     if not isinstance(taxonomy, list) or not taxonomy:
         errors.append("TriDet taxonomy must be a non-empty array")
         taxonomy = []
+    elif len(set(map(str, taxonomy))) != len(taxonomy):
+        errors.append("TriDet taxonomy contains duplicate labels")
     expected_map = {str(label): index for index, label in enumerate(taxonomy)}
     if label_to_id != expected_map:
         errors.append("TriDet label_to_id must exactly match taxonomy order")
@@ -82,6 +89,16 @@ def validate_tridet_payload(payload: dict[str, Any], require_training_subset: bo
             errors.append(f"{prefix}.duration must be positive")
         if fps <= 0:
             errors.append(f"{prefix}.fps must be positive")
+        if "source_start_sec" in record or "source_end_sec" in record:
+            try:
+                source_start = float(record["source_start_sec"])
+                source_end = float(record["source_end_sec"])
+                if source_start < 0 or source_end <= source_start:
+                    errors.append(f"{prefix} has an invalid source time range")
+                elif abs((source_end - source_start) - duration) > 1e-3:
+                    errors.append(f"{prefix}.duration does not match its source time range")
+            except (KeyError, TypeError, ValueError):
+                errors.append(f"{prefix} source time range must be numeric and complete")
         subset = str(record.get("subset", ""))
         if subset not in valid_subsets:
             errors.append(f"{prefix}.subset is invalid: {subset}")

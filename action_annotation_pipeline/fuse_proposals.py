@@ -50,6 +50,9 @@ def _coalesce_pose_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def _compatible(left: dict[str, Any], right: dict[str, Any], iou_threshold: float = 0.30) -> bool:
+    left_type, right_type = str(left.get("event_type", "action")), str(right.get("event_type", "action"))
+    if (left_type == "balance") != (right_type == "balance"):
+        return False
     left_group, right_group = _limb_group(left), _limb_group(right)
     if left_group != "unknown" and right_group != "unknown" and left_group != right_group:
         return False
@@ -69,6 +72,10 @@ def _compatible(left: dict[str, Any], right: dict[str, Any], iou_threshold: floa
         # peaks are duplicate observations of the same event.
         left_task, right_task = _task_id(left), _task_id(right)
         if left_task and left_task == right_task:
+            left_technique = str(left.get("technique", "unknown_action"))
+            right_technique = str(right.get("technique", "unknown_action"))
+            if left_technique not in UNKNOWN and right_technique not in UNKNOWN and left_technique != right_technique:
+                return False
             return peak_difference < 0.18 and temporal_iou(left, right) >= iou_threshold
         if not left_task and not right_task and peak_difference >= 0.18:
             return False

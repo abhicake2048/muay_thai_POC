@@ -23,6 +23,8 @@ from export_tridet import main as export_tridet_main  # noqa: E402
 from propose_actions import main as propose_actions_main  # noqa: E402
 from propose_actions import generate_proposals  # noqa: E402
 from validate_events import validate  # noqa: E402
+from fuse_proposals import fuse  # noqa: E402
+from vlm_qwen import normalize_events, validate_vlm_payload  # noqa: E402
 
 
 class TemporalPipelineTests(unittest.TestCase):
@@ -169,6 +171,21 @@ class TemporalPipelineTests(unittest.TestCase):
             self.assertEqual(errors, [])
             self.assertEqual(report["verified_actions"], 1)
 
+    def test_validator_accepts_rejected_unknown_motion_without_training_label(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary)
+            (project / "annotations").mkdir()
+            (project / "qa").mkdir()
+            write_json(project / "manifest.json", {"proxy_video": {"duration_sec": 2.0}, "paths": {}, "video_id": "test"})
+            write_json(project / "annotations" / "classes.json", json.loads((PIPELINE_ROOT / "classes.json").read_text(encoding="utf-8")))
+            write_jsonl(project / "annotations" / "events.jsonl", [
+                {"event_id": "review", "event_type": "review_range", "start_sec": 0.0, "peak_sec": 1.0, "end_sec": 2.0, "label": "reviewed", "review_status": "verified"},
+                {"event_id": "noise", "event_type": "action", "actor_id": 0, "target_id": 1, "start_sec": 0.5, "peak_sec": 0.6, "end_sec": 0.8, "label": "unknown_action", "review_status": "rejected"},
+            ])
+            errors, _, report = validate(project, project / "annotations" / "events.jsonl", True, False)
+            self.assertEqual(errors, [])
+            self.assertEqual(report["verified_actions"], 0)
+
     def test_posec3d_actor_is_person_zero(self) -> None:
         pose_data = {
             "keypoints": np.stack([
@@ -241,6 +258,73 @@ class TemporalPipelineTests(unittest.TestCase):
             hybrid_report = build_report(project, "hybrid")
             self.assertFalse(hybrid_report["ok"])
             self.assertIn("Qwen processed windows but produced zero normalized action events", hybrid_report["critical_failures"])
+
+    def test_tridet_splits_streams_around_ignored_time(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary)
+            self.make_synthetic_project(project)
+            write_jsonl(project / "annotations" / "events.jsonl", [
+                {"event_id": "review", "event_type": "review_range", "start_sec": 0.0, "peak_sec": 1.0, "end_sec": 2.0, "label": "reviewed", "review_status": "verified"},
+                {"event_id": "cut", "event_type": "ignore", "start_sec": 0.2, "peak_sec": 0.3, "end_sec": 0.4, "label": "camera_cut", "review_status": "verified"},
+                {"event_id": "jab", "event_type": "action", "actor_id": 0, "target_id": 1, "start_sec": 0.5, "peak_sec": 0.7, "end_sec": 0.9, "label": "jab", "side": "left", "target_zone": "head", "outcome": "blocked", "review_status": "verified"},
+            ])
+            with patch.object(sys, "argv", ["export_posec3d.py", "--project", str(project)]):
+                self.assertEqual(export_posec3d_main(), 0)
+            with patch.object(sys, "argv", ["export_tridet.py", "--project", str(project)]):
+                self.assertEqual(export_tridet_main(), 0)
+            metadata = read_jsonl(project / "exports" / "posec3d" / "sample_metadata.jsonl")
+            self.assertEqual(metadata[0]["clip_start_sec"], 0.4)
+            payload = json.loads((project / "exports" / "tridet" / "annotations.json").read_text(encoding="utf-8"))
+            self.assertEqual(len(payload["database"]), 4)
+            stream = payload["database"]["test__fighter0__part001"]
+            self.assertEqual(stream["source_start_sec"], 0.4)
+            self.assertEqual(stream["annotations"][0]["source_segment"], [0.5, 0.9])
+            self.assertAlmostEqual(stream["annotations"][0]["segment"][0], 0.1)
+            self.assertEqual(payload["metadata"]["ignored_ranges"], [[0.2, 0.4]])
+
+    def test_structured_vlm_to_human_review_to_both_training_exports(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary)
+            self.make_synthetic_project(project)
+            schema = json.loads((PIPELINE_ROOT / "classes.json").read_text(encoding="utf-8"))
+            payload = {
+                "contains_action": True,
+                "window_summary": "Fighter 0 extends the left lead hand toward the head.",
+                "events": [{
+                    "start_offset_sec": 0.5, "peak_offset_sec": 0.7, "end_offset_sec": 0.9,
+                    "technique": "jab", "technique_candidates": [{"technique": "jab", "confidence": 0.92}],
+                    "anatomical_side": "left", "effector_limb": "hand", "stance_at_start": "orthodox",
+                    "stance_role": "lead", "target_zone": "head", "outcome": "attempted",
+                    "contact_surface": "fist", "visibility": "visible", "confidence": 0.92,
+                    "uncertainty_flags": [], "classification_reason": "Lead wrist travels straight toward the head.",
+                    "boundary_reason": "Extension onset to completed retraction.",
+                    "visual_evidence": ["left wrist advances", "left elbow extends"],
+                }],
+                "no_action_confidence": 0.0, "no_action_reason": "",
+            }
+            validate_vlm_payload(payload, 2.0, set(schema["primary_action_classes"]), schema)
+            task = {"task_id": "replay_1", "kind": "candidate", "actor_id": 0, "start_sec": 0.0, "end_sec": 2.0, "source": None}
+            qwen_events = normalize_events(payload, task, {"video_id": "test", "proxy_video": {"fps": 10.0}}, schema)
+            fused = fuse(qwen_events, schema)
+            self.assertEqual(fused[0]["technique"], "jab")
+            self.assertEqual(fused[0]["branch_evidence"][0]["classification_reason"], payload["events"][0]["classification_reason"])
+            reviewed = dict(fused[0], event_id="reviewed_jab", review_status="verified", annotator="unit_test")
+            write_jsonl(project / "annotations" / "events.jsonl", [
+                {"event_id": "review", "event_type": "review_range", "start_sec": 0.0, "peak_sec": 1.0, "end_sec": 2.0, "label": "reviewed", "review_status": "verified"},
+                reviewed,
+            ])
+            with patch.object(sys, "argv", ["export_posec3d.py", "--project", str(project)]):
+                self.assertEqual(export_posec3d_main(), 0)
+            with patch.object(sys, "argv", ["export_tridet.py", "--project", str(project)]):
+                self.assertEqual(export_tridet_main(), 0)
+            with (project / "exports" / "posec3d" / "posec3d_annotations.pkl").open("rb") as handle:
+                import pickle
+                pose_payload = pickle.load(handle)
+            self.assertEqual(pose_payload["annotations"][0]["event_start_frame"], 5)
+            tridet = json.loads((project / "exports" / "tridet" / "annotations.json").read_text(encoding="utf-8"))
+            tri_event = tridet["database"]["test__fighter0"]["annotations"][0]
+            self.assertEqual(tri_event["segment_frames"], [5, 9])
+            self.assertEqual(tri_event["label_id"], tridet["label_to_id"]["jab"])
 
 
 if __name__ == "__main__":

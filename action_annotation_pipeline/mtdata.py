@@ -374,9 +374,18 @@ def command_evaluate(args: argparse.Namespace) -> int:
 def command_features(args: argparse.Namespace) -> int:
     project = args.project.expanduser().resolve()
     manifest = read_json(project / "manifest.json")
-    outputs = [project / "exports" / "tridet" / "features" / f"{manifest['video_id']}__fighter{fighter}.npy" for fighter in range(int(manifest.get("expected_fighters", 2)))]
-    arguments = ["--project", str(project), "--model", str(args.model.expanduser().resolve()), "--device", args.device, "--stride", str(args.stride), "--clip-frames", str(args.clip_frames)]
-    _stage(project, "videomae_features", "extract_videomae_features.py", arguments, [Path(manifest["paths"]["proxy_video"]), project / "tracks" / "tracks.jsonl", args.model.expanduser().resolve()], outputs, args.overwrite)
+    annotations_path = project / "exports" / "tridet" / "annotations.json"
+    if not annotations_path.is_file():
+        raise PipelineError("TriDet annotations are missing; run mtdata export before mtdata features")
+    tridet_payload = read_json(annotations_path)
+    outputs = [
+        project / "exports" / "tridet" / "features" / f"{stream_id}.npy"
+        for stream_id in tridet_payload.get("database", {})
+    ]
+    if not outputs:
+        raise PipelineError("TriDet annotations contain no actor streams")
+    arguments = ["--project", str(project), "--model", str(args.model.expanduser().resolve()), "--device", args.device, "--stride", str(args.stride), "--clip-frames", str(args.clip_frames), "--max-box-gap-frames", str(args.max_box_gap_frames), "--minimum-actor-crop-coverage", str(args.minimum_actor_crop_coverage)]
+    _stage(project, "videomae_features", "extract_videomae_features.py", arguments, [Path(manifest["paths"]["proxy_video"]), project / "tracks" / "tracks.jsonl", project / "poses" / "poses.npz", annotations_path, args.model.expanduser().resolve()], outputs, args.overwrite)
     return 0
 
 
@@ -521,6 +530,8 @@ def build_parser() -> argparse.ArgumentParser:
     features.add_argument("--device", default="cuda")
     features.add_argument("--stride", type=int, default=4)
     features.add_argument("--clip-frames", type=int, default=16)
+    features.add_argument("--max-box-gap-frames", type=int, default=6)
+    features.add_argument("--minimum-actor-crop-coverage", type=float, default=0.80)
     features.add_argument("--overwrite", action="store_true")
     features.set_defaults(func=command_features)
 

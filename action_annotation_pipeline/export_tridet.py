@@ -7,7 +7,7 @@ import json
 import sys
 from pathlib import Path
 
-from common import PipelineError, load_manifest, read_json, read_jsonl, write_json
+from common import PipelineError, load_manifest, read_json, read_jsonl, subtract_intervals, write_json
 from validate_events import validate
 from schema import canonicalize_event, flatten_label
 from training_contracts import validate_tridet_payload
@@ -42,65 +42,79 @@ def main() -> int:
         events = read_jsonl(project / "annotations" / "events.jsonl")
         duration = float(manifest["proxy_video"]["duration_sec"])
         fps = float(manifest["proxy_video"]["fps"])
+        canonical_events = [canonicalize_event(event, schema) for event in events]
+        review_ranges = [
+            (float(event["start_sec"]), float(event["end_sec"]))
+            for event in canonical_events
+            if event.get("event_type") == "review_range" and event.get("review_status") == "verified"
+        ]
+        ignored_ranges = [
+            (float(event["start_sec"]), float(event["end_sec"]))
+            for event in canonical_events
+            if event.get("event_type") == "ignore" and event.get("review_status") in {"verified", "uncertain"}
+        ]
+        valid_ranges = subtract_intervals(review_ranges, ignored_ranges)
+        if not valid_ranges:
+            raise PipelineError("No trainable reviewed time remains after subtracting ignored intervals")
         taxonomy = list(schema.get("trainable_event_classes", schema["primary_action_classes"]))
         label_to_id = {label: index for index, label in enumerate(taxonomy)}
         database: dict[str, object] = {}
         for fighter_id in range(int(manifest.get("expected_fighters", 2))):
-            annotations = []
-            flat_annotations = []
-            for raw_event in events:
-                event = canonicalize_event(raw_event, schema)
-                if event.get("event_type") not in {"action", "balance"} or event.get("review_status") != "verified":
-                    continue
-                if int(event.get("actor_id", -1)) != fighter_id:
-                    continue
-                label = str(event.get("technique") or event["label"])
-                annotations.append({
-                    "segment": [float(event["start_sec"]), float(event["end_sec"])],
-                    "segment_frames": [
-                        int(event.get("proxy_start_frame", round(float(event["start_sec"]) * fps))),
-                        int(event.get("proxy_end_frame", round(float(event["end_sec"]) * fps))),
-                    ],
-                    "source_segment_frames": [
-                        int(event.get("source_start_frame", event.get("proxy_start_frame", round(float(event["start_sec"]) * fps)))),
-                        int(event.get("source_end_frame", event.get("proxy_end_frame", round(float(event["end_sec"]) * fps)))),
-                    ],
-                    "label": label,
-                    "label_id": int(label_to_id[label]),
-                    "event_type": event.get("event_type"),
-                    "flat_label": flatten_label(event),
-                    "event_id": str(event["event_id"]),
-                    "peak_sec": float(event.get("peak_sec", (float(event["start_sec"]) + float(event["end_sec"])) / 2)),
-                    "peak_frame": int(event.get("proxy_peak_frame", round(float(event.get("peak_sec", 0.0)) * fps))),
-                    "source_peak_frame": int(event.get("source_peak_frame", event.get("proxy_peak_frame", round(float(event.get("peak_sec", 0.0)) * fps)))),
-                    "target_id": int(event.get("target_id", -1)),
-                    "action_family": event.get("action_family"),
-                    "anatomical_side": event.get("anatomical_side", "unknown"),
-                    "effector_limb": event.get("effector_limb", "unknown"),
-                    "effector_id": event.get("effector_id", "unknown"),
-                    "stance_at_start": event.get("stance_at_start", "unknown"),
-                    "stance_role": event.get("stance_role", "unknown"),
-                    "target_zone": event.get("target_zone", "unknown"),
-                    "outcome": event.get("outcome", "uncertain"),
-                    "contact_surface": event.get("contact_surface", "unknown"),
-                    "visibility": event.get("visibility", "unknown"),
-                })
-                flat_annotations.append({
-                    "segment": [float(event["start_sec"]), float(event["end_sec"])],
-                    "label": flatten_label(event), "event_id": str(event["event_id"]),
-                })
-            annotations.sort(key=lambda item: item["segment"][0])
-            flat_annotations.sort(key=lambda item: item["segment"][0])
-            stream_id = f"{manifest['video_id']}__fighter{fighter_id}"
-            database[stream_id] = {
-                "duration": duration,
-                "fps": fps,
-                "subset": manifest.get("subset", "training"),
-                "source_video": manifest["video_id"],
-                "actor_id": fighter_id,
-                "annotations": annotations,
-                "flattened_annotations": flat_annotations,
-            }
+            fighter_events = [
+                event for event in canonical_events
+                if event.get("event_type") in {"action", "balance"}
+                and event.get("review_status") == "verified"
+                and int(event.get("actor_id", -1)) == fighter_id
+            ]
+            for range_index, (range_start, range_end) in enumerate(valid_ranges):
+                annotations = []
+                flat_annotations = []
+                for event in fighter_events:
+                    event_start, event_end = float(event["start_sec"]), float(event["end_sec"])
+                    if event_end <= range_start or event_start >= range_end:
+                        continue
+                    if event_start < range_start - 1e-6 or event_end > range_end + 1e-6:
+                        raise PipelineError(f"Verified event {event['event_id']} crosses an ignored or unreviewed boundary")
+                    local_start, local_end = event_start - range_start, event_end - range_start
+                    source_peak = float(event.get("peak_sec", (event_start + event_end) / 2))
+                    local_peak = source_peak - range_start
+                    label = str(event.get("technique") or event["label"])
+                    annotations.append({
+                        "segment": [local_start, local_end],
+                        "source_segment": [event_start, event_end],
+                        "segment_frames": [int(round(local_start * fps)), int(round(local_end * fps))],
+                        "source_proxy_segment_frames": [
+                            int(event.get("proxy_start_frame", round(event_start * fps))),
+                            int(event.get("proxy_end_frame", round(event_end * fps))),
+                        ],
+                        "source_segment_frames": [
+                            int(event.get("source_start_frame", event.get("proxy_start_frame", round(event_start * fps)))),
+                            int(event.get("source_end_frame", event.get("proxy_end_frame", round(event_end * fps)))),
+                        ],
+                        "label": label, "label_id": int(label_to_id[label]),
+                        "event_type": event.get("event_type"), "flat_label": flatten_label(event),
+                        "event_id": str(event["event_id"]), "peak_sec": local_peak,
+                        "source_peak_sec": source_peak, "peak_frame": int(round(local_peak * fps)),
+                        "source_proxy_peak_frame": int(event.get("proxy_peak_frame", round(source_peak * fps))),
+                        "source_peak_frame": int(event.get("source_peak_frame", event.get("proxy_peak_frame", round(source_peak * fps)))),
+                        "target_id": int(event.get("target_id", -1)), "action_family": event.get("action_family"),
+                        "anatomical_side": event.get("anatomical_side", "unknown"),
+                        "effector_limb": event.get("effector_limb", "unknown"), "effector_id": event.get("effector_id", "unknown"),
+                        "stance_at_start": event.get("stance_at_start", "unknown"), "stance_role": event.get("stance_role", "unknown"),
+                        "target_zone": event.get("target_zone", "unknown"), "outcome": event.get("outcome", "uncertain"),
+                        "contact_surface": event.get("contact_surface", "unknown"), "visibility": event.get("visibility", "unknown"),
+                    })
+                    flat_annotations.append({"segment": [local_start, local_end], "label": flatten_label(event), "event_id": str(event["event_id"])})
+                annotations.sort(key=lambda item: item["segment"][0])
+                flat_annotations.sort(key=lambda item: item["segment"][0])
+                full_stream = len(valid_ranges) == 1 and range_start <= 1e-6 and range_end >= duration - 1e-6
+                stream_id = f"{manifest['video_id']}__fighter{fighter_id}" if full_stream else f"{manifest['video_id']}__fighter{fighter_id}__part{range_index:03d}"
+                database[stream_id] = {
+                    "duration": range_end - range_start, "fps": fps,
+                    "subset": manifest.get("subset", "training"), "source_video": manifest["video_id"],
+                    "actor_id": fighter_id, "source_start_sec": range_start, "source_end_sec": range_end,
+                    "annotations": annotations, "flattened_annotations": flat_annotations,
+                }
         payload = {
             "version": "muay_thai_actions_v2",
             "taxonomy": taxonomy,
@@ -110,6 +124,9 @@ def main() -> int:
                 "reviewed_duration_sec": report["reviewed_duration_sec"],
                 "full_video_duration_sec": duration,
                 "partial_export": bool(args.allow_partial),
+                "reviewed_ranges": review_ranges,
+                "ignored_ranges": ignored_ranges,
+                "trainable_ranges": valid_ranges,
                 "feature_contract": "One actor-conditioned FP16 VideoMAEv2 .npy array per database key; initial feat_stride=4 proxy frames at 30 FPS.",
                 "annotation_contract": "TriDet/ActivityNet JSON: database -> stream -> duration/fps/subset/annotations; every annotation has segment seconds, label and label_id.",
                 "canonical_label_contract": "TriDet localizes technique. PoseC3D attribute heads classify anatomical side, stance role, target and outcome for each detected interval.",
@@ -138,6 +155,7 @@ def main() -> int:
             else:
                 feature_manifest[stream_id] = {
                     "feature_file": f"features/{stream_id}.npy",
+                    "timestamps_file": f"features/timestamps/{stream_id}.npy",
                     "status": "not_extracted",
                     "actor_id": record["actor_id"],
                     "duration": record["duration"],

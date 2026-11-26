@@ -54,6 +54,7 @@ def validate(project: Path, events_path: Path, require_full_review: bool, allow_
     ids: set[str] = set()
     counts: Counter[str] = Counter()
     review_ranges: list[tuple[float, float]] = []
+    ignore_ranges: list[tuple[float, float]] = []
     verified_actions: list[dict[str, Any]] = []
     is_v2 = str(schema.get("schema_version", "1.0")).startswith("2")
 
@@ -81,11 +82,12 @@ def validate(project: Path, events_path: Path, require_full_review: bool, allow_
         if not start <= peak <= end:
             errors.append(f"{prefix}: peak_sec must be inside start/end")
         label = str(event.get("technique") or event.get("label", ""))
-        if label not in allowed_labels(schema, event_type):
-            errors.append(f"{prefix}: label {label!r} is invalid for {event_type}")
         status = str(event.get("review_status", ""))
         if status not in schema.get("review_statuses", []):
             errors.append(f"{prefix}: invalid review_status {status!r}")
+        non_training_unknown = status in {"rejected", "uncertain"} and label == "unknown_action"
+        if label not in allowed_labels(schema, event_type) and not non_training_unknown:
+            errors.append(f"{prefix}: label {label!r} is invalid for {event_type}")
         if status == "proposed" and not allow_proposals:
             errors.append(f"{prefix}: automatic proposal has not been reviewed")
         if event_type == "action":
@@ -98,14 +100,15 @@ def validate(project: Path, events_path: Path, require_full_review: bool, allow_
                 errors.append(f"{prefix}: actor_id must be canonical fighter 0 or 1")
             if target not in (-1, 0, 1) or target == actor:
                 errors.append(f"{prefix}: target_id must be the opponent or -1")
-            side = event.get("anatomical_side", event.get("side"))
-            if side not in schema.get("anatomical_sides", schema.get("sides", [])):
-                errors.append(f"{prefix}: invalid anatomical_side")
-            if event.get("target_zone") not in schema.get("target_zones", []):
-                errors.append(f"{prefix}: invalid target_zone")
-            if event.get("outcome") not in schema.get("outcomes", []):
-                errors.append(f"{prefix}: invalid outcome")
-            if is_v2:
+            if status != "rejected" and not non_training_unknown:
+                side = event.get("anatomical_side", event.get("side"))
+                if side not in schema.get("anatomical_sides", schema.get("sides", [])):
+                    errors.append(f"{prefix}: invalid anatomical_side")
+                if event.get("target_zone") not in schema.get("target_zones", []):
+                    errors.append(f"{prefix}: invalid target_zone")
+                if event.get("outcome") not in schema.get("outcomes", []):
+                    errors.append(f"{prefix}: invalid outcome")
+            if is_v2 and status != "rejected" and not non_training_unknown:
                 family = str(event.get("action_family", ""))
                 expected_family = technique_family(schema, label)
                 if not expected_family:
@@ -138,9 +141,12 @@ def validate(project: Path, events_path: Path, require_full_review: bool, allow_
                 verified_actions.append(event)
         if event_type == "review_range" and status == "verified":
             review_ranges.append((start, end))
+        if event_type == "ignore" and status in {"verified", "uncertain"}:
+            ignore_ranges.append((start, end))
         counts[f"{event_type}:{label}:{status}"] += 1
 
     merged_review = merge_intervals(review_ranges)
+    merged_ignore = merge_intervals(ignore_ranges)
     verified_atomic_actions = [event for event in verified_actions if event.get("event_type") == "action"]
     for left_index, left in enumerate(verified_atomic_actions):
         for right in verified_atomic_actions[left_index + 1:]:
@@ -163,6 +169,11 @@ def validate(project: Path, events_path: Path, require_full_review: bool, allow_
     for event in verified_actions:
         if not interval_covered(float(event["start_sec"]), float(event["end_sec"]), merged_review):
             errors.append(f"{event['event_id']}: verified action lies outside verified review_range")
+        if any(
+            float(event["start_sec"]) < ignored_end and float(event["end_sec"]) > ignored_start
+            for ignored_start, ignored_end in merged_ignore
+        ):
+            errors.append(f"{event['event_id']}: verified action overlaps an ignored interval")
     covered_duration = sum(end - start for start, end in merged_review)
     if require_full_review and (not merged_review or covered_duration < duration - 0.10):
         errors.append(f"Full review required, but review ranges cover {covered_duration:.3f}/{duration:.3f} seconds")
@@ -175,6 +186,7 @@ def validate(project: Path, events_path: Path, require_full_review: bool, allow_
         "video_duration_sec": duration,
         "reviewed_duration_sec": covered_duration,
         "review_ranges": merged_review,
+        "ignore_ranges": merged_ignore,
         "counts": dict(sorted(counts.items())),
         "errors": errors,
         "warnings": warnings,

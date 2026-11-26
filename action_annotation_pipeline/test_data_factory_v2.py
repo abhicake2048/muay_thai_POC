@@ -22,11 +22,13 @@ from state import StageState, stage_signature  # noqa: E402
 from validate_events import validate  # noqa: E402
 from benchmark_trackers import score_tracker  # noqa: E402
 from action_diagnostics import _assessment_coverage  # noqa: E402
-from vlm_qwen import _json_object, build_scan_tasks, normalize_events, validate_vlm_payload  # noqa: E402
-from extract_videomae_features import pool_video_tokens  # noqa: E402
+from vlm_qwen import _composite_frames, _json_object, build_scan_tasks, normalize_events, validate_vlm_payload  # noqa: E402
+from extract_videomae_features import pool_video_tokens, slice_stream_features  # noqa: E402
 from training_contracts import validate_tridet_payload  # noqa: E402
+from review import fiftyone_detections_to_events  # noqa: E402
 
 import numpy as np
+import cv2
 
 
 class DataFactoryV2Tests(unittest.TestCase):
@@ -128,6 +130,20 @@ class DataFactoryV2Tests(unittest.TestCase):
         self.assertEqual(len(tasks), 1)
         self.assertEqual(len(tasks[0]["source_event_ids"]), 3)
 
+    def test_vlm_composite_preserves_timestamps_when_actor_box_is_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            video = Path(temporary) / "clip.mp4"
+            writer = cv2.VideoWriter(str(video), cv2.VideoWriter_fourcc(*"mp4v"), 10.0, (64, 64))
+            self.assertTrue(writer.isOpened())
+            for frame in range(10):
+                writer.write(np.full((64, 64, 3), frame * 10, dtype=np.uint8))
+            writer.release()
+            tracks = {0: [{"fighter_id": 0, "track_id": 1, "bbox_xyxy": [8, 4, 40, 60]}]}
+            frames, stats = _composite_frames(video, 0.0, 1.0, 10.0, 0, 10.0, tracks, {"fighters": []})
+            self.assertEqual(len(frames), 10)
+            self.assertEqual(stats["decoded_frames"], 10)
+            self.assertEqual(stats["actor_crop_coverage"], 0.7)
+
     def test_component_first_segmentation_removes_duplicate_peak_intervals(self) -> None:
         noisy_single = np.asarray([0, 0, 0.9, 2.5, 1.4, 2.2, 0.9, 0.9, 0, 0], dtype=np.float32)
         self.assertEqual(len(action_components(noisy_single, 2.0, 0.75, 2)), 1)
@@ -202,6 +218,26 @@ class DataFactoryV2Tests(unittest.TestCase):
         with self.assertRaises(ValueError):
             validate_vlm_payload(invalid, 3.0, set(self.schema["primary_action_classes"]), self.schema)
 
+    def test_vlm_can_emit_balance_event_without_merging_into_strike_motion(self) -> None:
+        prediction = {
+            "start_offset_sec": 0.5, "peak_offset_sec": 0.8, "end_offset_sec": 1.2,
+            "technique": "knockdown", "technique_candidates": [{"technique": "knockdown", "confidence": 0.9}],
+            "anatomical_side": "not_applicable", "effector_limb": "whole_body",
+            "stance_at_start": "unknown", "stance_role": "not_applicable", "target_zone": "not_applicable",
+            "outcome": "uncertain", "contact_surface": "not_applicable", "visibility": "visible",
+            "confidence": 0.9, "uncertainty_flags": [], "classification_reason": "Actor falls to the canvas.",
+            "boundary_reason": "Loss of balance through ground contact.", "visual_evidence": ["torso descends", "body reaches canvas"],
+        }
+        payload = {"contains_action": True, "window_summary": "Actor is knocked down.", "events": [prediction], "no_action_confidence": 0.0, "no_action_reason": ""}
+        allowed = set(self.schema["trainable_event_classes"])
+        validate_vlm_payload(payload, 3.0, allowed, self.schema)
+        task = {"task_id": "balance", "kind": "dense", "actor_id": 0, "start_sec": 5.0, "end_sec": 8.0, "source": None}
+        event = normalize_events(payload, task, {"video_id": "test", "proxy_video": {"fps": 30.0}}, self.schema)[0]
+        self.assertEqual(event["event_type"], "balance")
+        self.assertEqual(event["target_id"], -1)
+        strike = {**event, "event_id": "pose", "event_type": "action", "technique": "unknown_action", "proposal_branch": "pose_actionness"}
+        self.assertEqual(len(fuse([event, strike], self.schema)), 2)
+
     def test_videomae_pooling_preserves_channel_dimension(self) -> None:
         class TensorStub:
             def __init__(self, array):
@@ -219,6 +255,41 @@ class DataFactoryV2Tests(unittest.TestCase):
         vector = pool_video_tokens(TensorStub(np.arange(24).reshape(1, 3, 8)))
         self.assertEqual(vector.shape, (8,))
         self.assertTrue(np.allclose(vector, np.arange(8) + 8))
+
+    def test_fiftyone_review_round_trip_emits_syncable_events(self) -> None:
+        class Detection(dict):
+            def __init__(self, label, support, **fields):
+                super().__init__(fields)
+                self.label = label
+                self.support = support
+            def get_field(self, key):
+                if key == "label":
+                    return self.label
+                if key == "support":
+                    return self.support
+                return self.get(key)
+        rows = fiftyone_detections_to_events([
+            Detection("reviewed", [1, 61]),
+            Detection("jab", [16, 31], event_id="jab", event_type="action", actor_id=0, target_id=1,
+                      anatomical_side="left", effector_limb="hand", stance_at_start="orthodox", stance_role="lead",
+                      target_zone="head", outcome="attempted", contact_surface="fist", visibility="visible",
+                      review_status="verified", proxy_peak_frame=22),
+        ], 30.0, self.schema)
+        self.assertEqual(rows[0]["event_type"], "review_range")
+        self.assertEqual(rows[0]["review_status"], "verified")
+        action = next(row for row in rows if row["event_type"] == "action")
+        self.assertEqual((action["start_sec"], action["peak_sec"], action["end_sec"]), (0.5, 0.733333, 1.0))
+        self.assertEqual(action["effector_id"], "left_hand")
+
+    def test_feature_slicing_excludes_clips_crossing_ignored_boundaries(self) -> None:
+        features = np.arange(24, dtype=np.float32).reshape(6, 4)
+        timestamps = np.asarray([0.25, 0.75, 1.25, 1.75, 2.25, 2.75])
+        starts = timestamps - 0.25
+        ends = timestamps + 0.25
+        sliced, local_times = slice_stream_features(features, timestamps, starts, ends, 1.0, 2.5)
+        self.assertEqual(sliced.shape, (3, 4))
+        self.assertTrue(np.array_equal(sliced, features[2:5]))
+        self.assertTrue(np.allclose(local_times, [0.25, 0.75, 1.25]))
 
     def test_conflicting_low_confidence_side_stays_unknown(self) -> None:
         base = {"actor_id": 0, "target_id": 1, "start_sec": 1.0, "peak_sec": 1.3, "end_sec": 1.6, "event_type": "action", "review_status": "proposed", "effector_limb": "hand"}
@@ -247,6 +318,14 @@ class DataFactoryV2Tests(unittest.TestCase):
         ]
         output = fuse(rows, self.schema)
         self.assertEqual(len(output), 2)
+
+    def test_fusion_preserves_simultaneous_different_actions_from_one_vlm_window(self) -> None:
+        base = {"actor_id": 0, "target_id": 1, "start_sec": 1.0, "peak_sec": 1.3, "end_sec": 1.6, "event_type": "action", "review_status": "proposed", "anatomical_side": "left", "effector_limb": "hand", "proposal_branch": "qwen_actions", "proposal_confidence": 0.9, "provenance": {"task_id": "same_window"}}
+        rows = [
+            {**base, "event_id": "jab", "technique": "jab"},
+            {**base, "event_id": "parry", "technique": "parry"},
+        ]
+        self.assertEqual(len(fuse(rows, self.schema)), 2)
 
     def test_fusion_merges_same_qwen_event_from_overlapping_scan_windows(self) -> None:
         base = {"actor_id": 0, "target_id": 1, "start_sec": 1.0, "end_sec": 1.5, "event_type": "action", "review_status": "proposed", "anatomical_side": "left", "effector_limb": "hand", "proposal_branch": "qwen_actions", "proposal_confidence": 0.9, "technique": "jab"}

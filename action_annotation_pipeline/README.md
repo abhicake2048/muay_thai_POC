@@ -63,7 +63,10 @@ diagnostics fail when dense assessment coverage is incomplete. Raw prompts,
 responses, crop coverage and normalized IDs remain in `proposals/raw/qwen/`.
 
 Open the generated `review/annotate.html` for the dependency-free reviewer, or
-install FiftyOne and add `--launch`. After exporting reviewed JSONL:
+install FiftyOne and add `--launch`. Closing the FiftyOne session writes
+`review/fiftyone_reviewed_events.jsonl`; labels named `reviewed`, `unreviewed`,
+`unusable`, `camera_cut`, or `replay` round-trip as review/ignore intervals.
+After exporting reviewed JSONL:
 
 ```powershell
 python mtdata.py sync-review generated/action_annotations_v2/sparring_1 reviewed_events.jsonl --overwrite
@@ -79,6 +82,11 @@ contain stream FPS, second/frame segments and stable `label_id` values. Run
 `mtdata features` before `mtdata freeze`; freezing now copies each
 actor-conditioned `[T,C]` VideoMAE array into `tridet_features/` and rejects an
 incomplete training package.
+
+TriDet streams are split around verified/uncertain `ignore` intervals. Their
+local annotations and VideoMAE clips therefore contain only reviewed,
+trainable footage; source seconds and frames remain attached for audit.
+Verified actions that overlap an ignored range are rejected during sync/export.
 
 See `DATA_FACTORY_V2.md` in the repository root for setup, full-profile model
 adapters, CVAT handoff, training and dataset-freeze instructions.

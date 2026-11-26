@@ -171,9 +171,13 @@ still images. Every sampled frame must contain the requested canonical actor;
 windows with less than 60% actor-crop coverage are rejected instead of being
 classified against the wrong fighter. Hybrid mode
 classifies every pose-actionness candidate and scans uncovered time at a
-1.5-second hop. It can return zero or multiple actions per window. Structured
-JSON, raw responses, parse failures, crop statistics, preview contact sheets,
-valid zero-event counts, and per-branch evidence are retained.
+1.5-second hop. It can return zero or multiple actions per window. Every
+response must be a validated action assessment or an explicit no-action
+assessment. Actions include ordered boundaries, ranked techniques, factorized
+attributes, confidence and concise observable evidence; no-action responses
+require a confidence and reason. Exact prompts, structured JSON, raw
+responses, parse failures, crop statistics, preview contact sheets, window
+coverage and per-branch evidence are retained.
 
 Candidate windows are grouped before Qwen inference. Pose motion is segmented
 component-first, so several numerical peaks within one strike no longer create
@@ -216,6 +220,12 @@ FiftyOne installed:
 python mtdata.py review generated/action_annotations_v2/sparring_1 --launch
 ```
 
+Edit proposal fields/statuses in `action_proposals`. Add temporal labels named
+`reviewed` for exhaustively watched ranges, or `unreviewed`, `unusable`,
+`camera_cut`, or `replay` for ignored ranges. When the FiftyOne session closes,
+the pipeline writes `review/fiftyone_reviewed_events.jsonl`, which can be
+passed directly to `mtdata sync-review`.
+
 Use FiftyOne for temporal intervals. Use the official local CVAT Docker
 deployment for track, box and skeleton corrections, importing the YOLO or COCO
 preannotations from `exports/yolo_feedback` and `exports/rtmpose_feedback`.
@@ -229,6 +239,9 @@ python mtdata.py sync-review PROJECT reviewed_events.jsonl --overwrite
 
 For TriDet training, every usable second must be covered by a verified
 `review_range`; all camera cuts/replays/unusable intervals need `ignore`.
+Verified actions may not overlap ignored time. The exporter subtracts ignored
+time and creates separate actor streams for the remaining contiguous ranges,
+so stock TriDet never learns a replay or camera cut as background.
 
 ## PoseC3D output
 
@@ -262,8 +275,11 @@ standard technique label remains compatible with an ordinary PoseC3D head.
 ## TriDet and VideoMAE output
 
 `exports/tridet/annotations.json` contains one actor-conditioned stream per
-fighter, preserving simultaneous overlapping attacks. Canonical labels are
-techniques; `flattened_annotations` provides an optional combined baseline.
+fighter and contiguous trainable range, preserving simultaneous overlapping
+attacks while excluding ignored footage. Segments are relative to each
+stream; source-video seconds and source/proxy frames remain alongside them for
+audit. Canonical labels are techniques; `flattened_annotations` provides an
+optional combined baseline.
 
 Extract dense, local VideoMAE/VideoMAEv2 features from an already downloaded
 Hugging Face-compatible model:
@@ -272,8 +288,10 @@ Hugging Face-compatible model:
 python mtdata.py features PROJECT --model models/videomae-v2 --device cuda --stride 4
 ```
 
-Features are FP16 arrays under `exports/tridet/features`. The manifest records
-model path, shape, clip length and feature stride for OpenTAD/TriDet config.
+Run `mtdata export` before feature extraction. Features are FP16 `[T,C]` arrays
+under `exports/tridet/features`, sliced so every receptive-field clip lies
+fully inside its trainable range. The manifest records model path, checksum,
+shape, clip length, timestamps and feature stride for OpenTAD/TriDet config.
 
 ## YOLO and RTMPose feedback
 
@@ -297,8 +315,9 @@ python mtdata.py freeze generated/action_annotations_v2 `
 ```
 
 The split unit is the source video, never an event clip or frame. The frozen
-folder contains combined PoseC3D and TriDet annotations, a split manifest,
-dataset card and fingerprint.
+folder contains combined PoseC3D and TriDet annotations, copied
+`tridet_features/<stream>.npy` arrays, timestamps, checksums, a split manifest,
+dataset card and fingerprint. Freeze fails when a feature stream is missing.
 
 ## Training launchers
 

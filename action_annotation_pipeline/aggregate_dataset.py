@@ -44,6 +44,8 @@ def split_groups(video_ids: list[str], seed: int) -> dict[str, list[str]]:
 
 
 def freeze(root: Path, output: Path, seed: int) -> dict[str, Any]:
+    if output.exists() and any(output.iterdir()):
+        raise PipelineError(f"Frozen dataset output is not empty: {output}; use a new version directory")
     projects = discover_projects(root)
     if not projects:
         raise PipelineError(f"No exported projects found below {root}")
@@ -104,13 +106,14 @@ def freeze(root: Path, output: Path, seed: int) -> dict[str, Any]:
         if not feature_manifest_path.is_file():
             raise PipelineError(f"TriDet feature manifest is missing for {video_id}; run mtdata features first")
         feature_manifest = read_json(feature_manifest_path)
-        timestamps_source = project / "exports" / "tridet" / "features" / "timestamps.npy"
         for stream_id, record in tri_payload["database"].items():
             value = dict(record)
             value["subset"] = {"train": "training", "val": "validation", "test": "testing"}[split]
             tridet_database[stream_id] = value
             feature_record = feature_manifest.get(stream_id, {})
             feature_path = project / "exports" / "tridet" / str(feature_record.get("feature_file", ""))
+            timestamps_value = feature_record.get("timestamps_file", "features/timestamps.npy")
+            timestamps_source = project / "exports" / "tridet" / str(timestamps_value)
             if feature_record.get("status") != "complete" or not feature_path.is_file():
                 raise PipelineError(f"TriDet feature array is missing or incomplete for {stream_id}; run mtdata features first")
             feature_array = np.load(feature_path, mmap_mode="r")
