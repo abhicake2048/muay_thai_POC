@@ -225,6 +225,9 @@ Edit proposal fields/statuses in `action_proposals`. Add temporal labels named
 `camera_cut`, or `replay` for ignored ranges. When the FiftyOne session closes,
 the pipeline writes `review/fiftyone_reviewed_events.jsonl`, which can be
 passed directly to `mtdata sync-review`.
+The persistent FiftyOne dataset resumes when its proposal fingerprint matches.
+After intentionally regenerating proposals, preserve any needed export and
+relaunch with `--reset-dataset` to start a new review.
 
 Use FiftyOne for temporal intervals. Use the official local CVAT Docker
 deployment for track, box and skeleton corrections, importing the YOLO or COCO

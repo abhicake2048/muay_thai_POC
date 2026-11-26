@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import shutil
@@ -44,7 +45,11 @@ def fiftyone_detections_to_events(detections: list[object], fps: float, schema: 
             event_type = "ignore"
         elif not event_type:
             event_type = "action"
-        peak_frame = int(_field(detection, "proxy_peak_frame", round((start_frame + end_frame) / 2)))
+        stored_peak = int(_field(detection, "proxy_peak_frame", round((start_frame + end_frame) / 2)))
+        # FiftyOne edits temporal support directly, while the action peak is a
+        # dynamic scalar field. If the interval is trimmed past the old peak,
+        # use the new midpoint instead of exporting an invalid event.
+        peak_frame = stored_peak if start_frame <= stored_peak <= end_frame else round((start_frame + end_frame) / 2)
         row = {
             "event_id": str(_field(detection, "event_id", f"fiftyone_{index:06d}")),
             "event_type": event_type,
@@ -109,7 +114,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--project", type=Path, required=True)
     parser.add_argument("--launch", action="store_true", help="Launch the FiftyOne app and block until closed")
     parser.add_argument("--port", type=int, default=5151)
+    parser.add_argument(
+        "--reset-dataset",
+        action="store_true",
+        help="Discard an existing persistent FiftyOne review and recreate it from current proposals",
+    )
     return parser.parse_args()
+
+
+def _review_input_fingerprint(paths: list[Path]) -> str:
+    digest = hashlib.sha256()
+    for path in paths:
+        digest.update(str(path.resolve()).encode("utf-8"))
+        if not path.is_file():
+            digest.update(b"missing")
+            continue
+        digest.update(path.read_bytes())
+    return digest.hexdigest()
 
 
 def main() -> int:
@@ -137,6 +158,8 @@ def main() -> int:
             "cvat_label_contract": str(project / "review" / "cvat_label_contract.json"),
             "human_verification_required": True,
         }
+        review_fingerprint = _review_input_fingerprint([proposal_path, assessments_path])
+        review_manifest["proposal_fingerprint"] = review_fingerprint
         write_json(project / "review" / "review_manifest.json", review_manifest)
         if args.launch:
             try:
@@ -145,44 +168,59 @@ def main() -> int:
                 raise PipelineError(f"FiftyOne is not installed: {exc}") from exc
             name = review_manifest["fiftyone_dataset"]
             if fo.dataset_exists(name):
-                dataset = fo.load_dataset(name)
-                dataset.delete()
-            dataset = fo.Dataset(name, persistent=True)
-            sample = fo.Sample(filepath=str(manifest["paths"]["proxy_video"]))
-            detections = []
+                existing = fo.load_dataset(name, reload=True)
+                existing_fingerprint = str(existing.info.get("mtdata_proposal_fingerprint", ""))
+                if args.reset_dataset:
+                    existing.delete()
+                elif existing_fingerprint != review_fingerprint:
+                    raise PipelineError(
+                        "The persistent FiftyOne review was created from different proposals. "
+                        "Close/export it first, then relaunch with --reset-dataset to replace it."
+                    )
+                else:
+                    dataset = existing
             fps = float(manifest["proxy_video"]["fps"])
-            for raw in proposals:
-                event = canonicalize_event(raw, schema)
-                detection = fo.TemporalDetection(
-                    label=str(event.get("technique", "unknown_action")),
-                    support=[int(round(float(event["start_sec"]) * fps)) + 1, int(round(float(event["end_sec"]) * fps)) + 1],
-                    confidence=float(event.get("proposal_confidence", 0.0)),
-                )
-                for key in ("event_id", "event_type", "actor_id", "target_id", "anatomical_side", "effector_limb", "effector_id", "stance_at_start", "stance_role", "target_zone", "outcome", "contact_surface", "visibility", "review_status", "annotator", "annotation_revision", "proxy_start_frame", "proxy_peak_frame", "proxy_end_frame", "classification_reason", "boundary_reason", "window_summary", "combo_id", "counter_to_event_id", "possible_cause", "round", "notes"):
-                    detection[key] = event.get(key)
-                detection["technique_candidates"] = json.dumps(event.get("technique_candidates", []), ensure_ascii=False)
-                detection["branch_evidence"] = json.dumps(event.get("branch_evidence", []), ensure_ascii=False)
-                detection["visual_evidence"] = json.dumps(event.get("visual_evidence", []), ensure_ascii=False)
-                detection["uncertainty_flags"] = json.dumps(event.get("uncertainty_flags", []), ensure_ascii=False)
-                detections.append(detection)
-            sample["action_proposals"] = fo.TemporalDetections(detections=detections)
-            assessment_detections = []
-            for assessment in assessments:
-                status = str(assessment.get("status", "unknown"))
-                value = fo.TemporalDetection(
-                    label=f"qwen_window__{status}",
-                    support=[int(round(float(assessment["start_sec"]) * fps)) + 1, int(round(float(assessment["end_sec"]) * fps)) + 1],
-                    confidence=float(assessment.get("no_action_confidence", 0.0)) if status == "no_action" else None,
-                )
-                for key in ("task_id", "actor_id", "scan_kind", "window_summary", "no_action_reason", "error"):
-                    value[key] = assessment.get(key)
-                value["normalized_event_ids"] = json.dumps(assessment.get("normalized_event_ids", []), ensure_ascii=False)
-                assessment_detections.append(value)
-            sample["qwen_window_assessments"] = fo.TemporalDetections(detections=assessment_detections)
-            dataset.add_sample(sample)
+            if not fo.dataset_exists(name):
+                dataset = fo.Dataset(name, persistent=True)
+                sample = fo.Sample(filepath=str(manifest["paths"]["proxy_video"]))
+                detections = []
+                for raw in proposals:
+                    event = canonicalize_event(raw, schema)
+                    detection = fo.TemporalDetection(
+                        label=str(event.get("technique", "unknown_action")),
+                        support=[int(round(float(event["start_sec"]) * fps)) + 1, int(round(float(event["end_sec"]) * fps)) + 1],
+                        confidence=float(event.get("proposal_confidence", 0.0)),
+                    )
+                    for key in ("event_id", "event_type", "actor_id", "target_id", "anatomical_side", "effector_limb", "effector_id", "stance_at_start", "stance_role", "target_zone", "outcome", "contact_surface", "visibility", "review_status", "annotator", "annotation_revision", "proxy_start_frame", "proxy_peak_frame", "proxy_end_frame", "classification_reason", "boundary_reason", "window_summary", "combo_id", "counter_to_event_id", "possible_cause", "round", "notes"):
+                        detection[key] = event.get(key)
+                    detection["technique_candidates"] = json.dumps(event.get("technique_candidates", []), ensure_ascii=False)
+                    detection["branch_evidence"] = json.dumps(event.get("branch_evidence", []), ensure_ascii=False)
+                    detection["visual_evidence"] = json.dumps(event.get("visual_evidence", []), ensure_ascii=False)
+                    detection["uncertainty_flags"] = json.dumps(event.get("uncertainty_flags", []), ensure_ascii=False)
+                    detections.append(detection)
+                sample["action_proposals"] = fo.TemporalDetections(detections=detections)
+                assessment_detections = []
+                for assessment in assessments:
+                    status = str(assessment.get("status", "unknown"))
+                    value = fo.TemporalDetection(
+                        label=f"qwen_window__{status}",
+                        support=[int(round(float(assessment["start_sec"]) * fps)) + 1, int(round(float(assessment["end_sec"]) * fps)) + 1],
+                        confidence=float(assessment.get("no_action_confidence", 0.0)) if status == "no_action" else None,
+                    )
+                    for key in ("task_id", "actor_id", "scan_kind", "window_summary", "no_action_reason", "error"):
+                        value[key] = assessment.get(key)
+                    value["normalized_event_ids"] = json.dumps(assessment.get("normalized_event_ids", []), ensure_ascii=False)
+                    assessment_detections.append(value)
+                sample["qwen_window_assessments"] = fo.TemporalDetections(detections=assessment_detections)
+                dataset.add_sample(sample)
+                dataset.info["mtdata_proposal_fingerprint"] = review_fingerprint
+                dataset.info["mtdata_project"] = manifest["project_id"]
+                dataset.save()
             session = fo.launch_app(dataset, port=args.port, address=os.environ.get("FIFTYONE_ADDRESS", "localhost"))
             session.wait()
-            dataset.save()
+            # App annotations autosave to the database. Reload the singleton so
+            # the export sees the final values written by the browser.
+            dataset = fo.load_dataset(name, reload=True)
             refreshed = dataset.first()
             reviewed_field = refreshed.get_field("action_proposals")
             reviewed_detections = list(reviewed_field.detections or []) if reviewed_field is not None else []

@@ -66,6 +66,9 @@ Open the generated `review/annotate.html` for the dependency-free reviewer, or
 install FiftyOne and add `--launch`. Closing the FiftyOne session writes
 `review/fiftyone_reviewed_events.jsonl`; labels named `reviewed`, `unreviewed`,
 `unusable`, `camera_cut`, or `replay` round-trip as review/ignore intervals.
+The persistent review resumes when the proposal fingerprint is unchanged. If
+you intentionally regenerated proposals, export/close the old review and pass
+`--reset-dataset` once to replace it.
 After exporting reviewed JSONL:
 
 ```powershell

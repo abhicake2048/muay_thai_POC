@@ -274,12 +274,18 @@ class DataFactoryV2Tests(unittest.TestCase):
                       anatomical_side="left", effector_limb="hand", stance_at_start="orthodox", stance_role="lead",
                       target_zone="head", outcome="attempted", contact_surface="fist", visibility="visible",
                       review_status="verified", proxy_peak_frame=22),
+            Detection("cross", [25, 31], event_id="cross", event_type="action", actor_id=0, target_id=1,
+                      anatomical_side="right", effector_limb="hand", stance_at_start="orthodox", stance_role="rear",
+                      target_zone="head", outcome="missed", contact_surface="fist", visibility="visible",
+                      review_status="verified", proxy_peak_frame=10),
         ], 30.0, self.schema)
         self.assertEqual(rows[0]["event_type"], "review_range")
         self.assertEqual(rows[0]["review_status"], "verified")
         action = next(row for row in rows if row["event_type"] == "action")
         self.assertEqual((action["start_sec"], action["peak_sec"], action["end_sec"]), (0.5, 0.733333, 1.0))
         self.assertEqual(action["effector_id"], "left_hand")
+        trimmed = next(row for row in rows if row["event_id"] == "cross")
+        self.assertEqual(trimmed["peak_sec"], 0.9)
 
     def test_feature_slicing_excludes_clips_crossing_ignored_boundaries(self) -> None:
         features = np.arange(24, dtype=np.float32).reshape(6, 4)

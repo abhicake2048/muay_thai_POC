@@ -312,6 +312,8 @@ def command_review(args: argparse.Namespace) -> int:
     command = [sys.executable, str(_script("review.py")), "--project", str(project), "--port", str(args.port)]
     if args.launch:
         command.append("--launch")
+    if args.reset_dataset:
+        command.append("--reset-dataset")
     _run(command, project / "logs" / "review.log")
     return 0
 
@@ -502,6 +504,7 @@ def build_parser() -> argparse.ArgumentParser:
     review.add_argument("project", type=Path)
     review.add_argument("--launch", action="store_true")
     review.add_argument("--port", type=int, default=5151)
+    review.add_argument("--reset-dataset", action="store_true", help="Discard and recreate the persistent FiftyOne review dataset")
     review.set_defaults(func=command_review)
 
     sync = subparsers.add_parser("sync-review", help="Validate and promote reviewed JSONL to ground truth")
