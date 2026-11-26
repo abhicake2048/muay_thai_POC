@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import sys
 from pathlib import Path
@@ -90,6 +91,36 @@ def _finite_number(value: Any, name: str) -> float:
     if not np.isfinite(number):
         raise ValueError(f"{name} must be finite")
     return number
+
+
+def _content_fingerprint(paths: list[Path], parameters: dict[str, Any]) -> str:
+    """Fingerprint one Qwen run without hashing multi-gigabyte model shards."""
+    digest = hashlib.sha256(json.dumps(parameters, sort_keys=True, default=str).encode("utf-8"))
+    for path in paths:
+        path = path.resolve()
+        digest.update(str(path).encode("utf-8"))
+        if not path.is_file():
+            digest.update(b"missing")
+            continue
+        stat = path.stat()
+        digest.update(str(stat.st_size).encode("ascii"))
+        # Video bytes and proposal JSONL are already content-hashed by the
+        # outer stage. Hash small contracts/configs here and use stable file
+        # metadata for large media so per-window resume stays inexpensive.
+        if stat.st_size <= 64 * 1024 * 1024:
+            with path.open("rb") as handle:
+                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                    digest.update(chunk)
+        else:
+            digest.update(str(stat.st_mtime_ns).encode("ascii"))
+    return digest.hexdigest()
+
+
+def _task_fingerprint(run_fingerprint: str, task: dict[str, Any]) -> str:
+    task_contract = {key: value for key, value in task.items() if key != "source"}
+    return hashlib.sha256(
+        (run_fingerprint + json.dumps(task_contract, sort_keys=True, default=str)).encode("utf-8")
+    ).hexdigest()
 
 
 def validate_vlm_payload(
@@ -475,6 +506,33 @@ def normalize_events(
     return results
 
 
+def load_resumable_task(
+    raw_path: Path,
+    task_fingerprint: str,
+    task: dict[str, Any],
+    manifest: dict[str, Any],
+    schema: dict[str, Any],
+    allowed_techniques: set[str],
+) -> tuple[dict[str, Any], dict[str, Any], list[dict[str, Any]]] | None:
+    """Load only a fingerprint-matched, semantically valid Qwen assessment."""
+    if not raw_path.is_file():
+        return None
+    try:
+        cached = read_json(raw_path)
+        payload = cached.get("parsed")
+        if cached.get("task_fingerprint") != task_fingerprint or not isinstance(payload, dict):
+            return None
+        validate_vlm_payload(
+            payload,
+            float(task["end_sec"]) - float(task["start_sec"]),
+            allowed_techniques,
+            schema,
+        )
+        return cached, payload, normalize_events(payload, task, manifest, schema)
+    except (KeyError, OSError, TypeError, ValueError, PipelineError):
+        return None
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--project", type=Path, required=True)
@@ -490,6 +548,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--minimum-actor-crop-coverage", type=float, default=0.60)
     parser.add_argument("--debug-previews", type=int, default=12)
     parser.add_argument("--max-new-tokens", type=int, default=1536)
+    parser.add_argument("--no-resume", action="store_true", help="Recompute successful per-window Qwen results")
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args()
 
@@ -567,6 +626,32 @@ def main() -> int:
         if args.limit:
             tasks = tasks[: args.limit]
 
+        model_contracts = sorted({
+            path
+            for pattern in ("*.json", "*.jinja", "*.txt", "*.model", "*.safetensors", "*.bin")
+            for path in model_path.glob(pattern)
+            if path.is_file()
+        })
+        run_fingerprint = _content_fingerprint(
+            [
+                video,
+                project / "tracks" / "tracks.jsonl",
+                project / "tracks" / "fighter_map.json",
+                source_path,
+                project / "annotations" / "classes.json",
+                *model_contracts,
+            ],
+            {
+                "adapter": "qwen3_vl_actions_v2",
+                "prompt": PROMPT,
+                "model": str(model_path),
+                "fps": args.fps,
+                "minimum_actor_crop_coverage": args.minimum_actor_crop_coverage,
+                "vision_mode": args.vision_mode,
+                "max_new_tokens": args.max_new_tokens,
+            },
+        )
+
         processor = AutoProcessor.from_pretrained(model_path, local_files_only=True, trust_remote_code=True)
         if hasattr(processor, "image_processor"):
             processor.image_processor.max_pixels = 448 * 448
@@ -594,19 +679,12 @@ def main() -> int:
         crop_failures = 0
         valid_zero_event_tasks = 0
         model_calls = 0
+        resumed_tasks = 0
         used_modes: dict[str, int] = {"video": 0, "frames": 0}
         previews_written = 0
         for task_index, task in enumerate(tasks, start=1):
-            images, crop_stats = _composite_frames(
-                video, float(task["start_sec"]), float(task["end_sec"]), args.fps,
-                int(task["actor_id"]), video_fps, tracks_by_frame, fighter_map,
-            )
-            record: dict[str, Any] = {
-                "task": {key: value for key, value in task.items() if key != "source"},
-                "source_event_id": task.get("source", {}).get("event_id") if isinstance(task.get("source"), dict) else None,
-                "frame_count": len(images),
-                "crop_stats": crop_stats,
-            }
+            task_fingerprint = _task_fingerprint(run_fingerprint, task)
+            raw_path = raw_dir / f"{task['task_id']}.json"
             assessment = {
                 "task_id": task["task_id"],
                 "scan_kind": task["kind"],
@@ -614,16 +692,57 @@ def main() -> int:
                 "start_sec": float(task["start_sec"]),
                 "end_sec": float(task["end_sec"]),
                 "source_event_ids": list(task.get("source_event_ids", [])),
-                "crop_stats": crop_stats,
                 "raw_record": f"proposals/raw/qwen/{task['task_id']}.json",
             }
+            if raw_path.is_file() and not args.no_resume:
+                cached_result = load_resumable_task(
+                    raw_path, task_fingerprint, task, manifest, schema, allowed_techniques
+                )
+                if cached_result is not None:
+                    cached, cached_payload, cached_events = cached_result
+                    cached_stats = dict(cached.get("crop_stats", {}))
+                    assessment.update({
+                        "crop_stats": cached_stats,
+                        "status": "action" if cached_events else "no_action",
+                        "contains_action": bool(cached_events),
+                        "window_summary": str(cached_payload.get("window_summary", "")).strip(),
+                        "no_action_confidence": float(cached_payload.get("no_action_confidence", 0.0)),
+                        "no_action_reason": str(cached_payload.get("no_action_reason", "")).strip(),
+                        "normalized_event_ids": [event["event_id"] for event in cached_events],
+                        "vision_mode": str(cached.get("vision_mode", args.vision_mode)),
+                        "resumed": True,
+                    })
+                    outputs.extend(cached_events)
+                    assessments.append(assessment)
+                    resumed_tasks += 1
+                    if not cached_events:
+                        valid_zero_event_tasks += 1
+                    cached_mode = str(cached.get("vision_mode", args.vision_mode))
+                    used_modes[cached_mode] = used_modes.get(cached_mode, 0) + 1
+                    continue
+                # Failed, stale, or legacy records are recomputed. Valid
+                # action and explicit no-action records are the only cache
+                # entries trusted across interrupted runs.
+            images, crop_stats = _composite_frames(
+                video, float(task["start_sec"]), float(task["end_sec"]), args.fps,
+                int(task["actor_id"]), video_fps, tracks_by_frame, fighter_map,
+            )
+            record: dict[str, Any] = {
+                "task": {key: value for key, value in task.items() if key != "source"},
+                "run_fingerprint": run_fingerprint,
+                "task_fingerprint": task_fingerprint,
+                "source_event_id": task.get("source", {}).get("event_id") if isinstance(task.get("source"), dict) else None,
+                "frame_count": len(images),
+                "crop_stats": crop_stats,
+            }
+            assessment["crop_stats"] = crop_stats
             if not images:
                 record["error"] = "no actor-targeted frames decoded"
                 assessment.update({"status": "failed", "error": record["error"], "contains_action": None})
                 assessments.append(assessment)
                 failures += 1
                 crop_failures += 1
-                write_json(raw_dir / f"{task['task_id']}.json", record)
+                write_json(raw_path, record)
                 continue
             if float(crop_stats["actor_crop_coverage"]) < args.minimum_actor_crop_coverage:
                 record["error"] = "insufficient_actor_crop_coverage"
@@ -631,7 +750,7 @@ def main() -> int:
                 assessments.append(assessment)
                 failures += 1
                 crop_failures += 1
-                write_json(raw_dir / f"{task['task_id']}.json", record)
+                write_json(raw_path, record)
                 continue
             if previews_written < max(0, args.debug_previews):
                 preview = np.concatenate([cv2.cvtColor(image, cv2.COLOR_RGB2BGR) for image in images[:4]], axis=1)
@@ -718,7 +837,7 @@ def main() -> int:
                 })
                 outputs.extend(events)
             assessments.append(assessment)
-            write_json(raw_dir / f"{task['task_id']}.json", record)
+            write_json(raw_path, record)
             if task_index % 10 == 0:
                 print(f"Qwen action scan {task_index}/{len(tasks)}; events={len(outputs)} failures={failures}", flush=True)
 
@@ -737,10 +856,13 @@ def main() -> int:
             "no_action_windows": sum(item.get("status") == "no_action" for item in assessments),
             "failed_windows": sum(item.get("status") == "failed" for item in assessments),
             "model_calls": model_calls,
+            "resumed_tasks": resumed_tasks,
+            "new_tasks_processed": len(tasks) - resumed_tasks,
             "vision_modes": used_modes,
             "debug_previews": previews_written,
             "scan_mode": args.scan_mode,
             "model": str(model_path),
+            "run_fingerprint": run_fingerprint,
             "local_only": True,
             "max_new_tokens": args.max_new_tokens,
             "window_assessments": str(assessments_output),

@@ -178,6 +178,9 @@ attributes, confidence and concise observable evidence; no-action responses
 require a confidence and reason. Exact prompts, structured JSON, raw
 responses, parse failures, crop statistics, preview contact sheets, window
 coverage and per-branch evidence are retained.
+Valid action and explicit no-action window records are fingerprinted and
+resumed after interruption. Failed, legacy, or input-mismatched records are
+recomputed, so a long local run does not repeat completed model calls.
 
 Candidate windows are grouped before Qwen inference. Pose motion is segmented
 component-first, so several numerical peaks within one strike no longer create

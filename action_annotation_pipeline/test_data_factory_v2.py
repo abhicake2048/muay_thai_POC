@@ -22,7 +22,7 @@ from state import StageState, stage_signature  # noqa: E402
 from validate_events import validate  # noqa: E402
 from benchmark_trackers import score_tracker  # noqa: E402
 from action_diagnostics import _assessment_coverage  # noqa: E402
-from vlm_qwen import _composite_frames, _json_object, build_scan_tasks, normalize_events, validate_vlm_payload  # noqa: E402
+from vlm_qwen import _composite_frames, _content_fingerprint, _json_object, _task_fingerprint, build_scan_tasks, load_resumable_task, normalize_events, validate_vlm_payload  # noqa: E402
 from extract_videomae_features import pool_video_tokens, slice_stream_features  # noqa: E402
 from training_contracts import validate_tridet_payload  # noqa: E402
 from review import fiftyone_detections_to_events  # noqa: E402
@@ -111,6 +111,39 @@ class DataFactoryV2Tests(unittest.TestCase):
         self.assertGreaterEqual(len(tasks), 4)
         self.assertEqual({task["actor_id"] for task in tasks}, {0, 1})
         self.assertTrue(all(task["kind"] == "dense" for task in tasks))
+
+    def test_qwen_resume_fingerprint_tracks_inputs_and_task_boundaries(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary) / "source.jsonl"
+            source.write_text('{"event_id":"one"}\n', encoding="utf-8")
+            first = _content_fingerprint([source], {"prompt": "v2", "fps": 8.0})
+            self.assertEqual(first, _content_fingerprint([source], {"fps": 8.0, "prompt": "v2"}))
+            task = {"task_id": "candidate_000001", "actor_id": 0, "start_sec": 1.0, "end_sec": 4.0, "source": {"volatile": True}}
+            signature = _task_fingerprint(first, task)
+            self.assertEqual(signature, _task_fingerprint(first, {**task, "source": {"different": True}}))
+            self.assertNotEqual(signature, _task_fingerprint(first, {**task, "end_sec": 4.5}))
+            source.write_text('{"event_id":"two"}\n', encoding="utf-8")
+            self.assertNotEqual(first, _content_fingerprint([source], {"prompt": "v2", "fps": 8.0}))
+
+    def test_qwen_resume_accepts_only_valid_action_assessments(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            raw = Path(temporary) / "window.json"
+            task = {"task_id": "dense_1", "kind": "dense", "actor_id": 1, "start_sec": 0.0, "end_sec": 3.0, "source": None}
+            manifest = {"video_id": "test", "proxy_video": {"fps": 30.0}}
+            no_action = {
+                "contains_action": False,
+                "window_summary": "Both fighters circle in guard.",
+                "events": [],
+                "no_action_confidence": 0.88,
+                "no_action_reason": "No committed attack or defense is visible.",
+            }
+            write_json(raw, {"task_fingerprint": "match", "parsed": no_action, "crop_stats": {"actor_crop_coverage": 1.0}})
+            result = load_resumable_task(raw, "match", task, manifest, self.schema, set(self.schema["trainable_event_classes"]))
+            self.assertIsNotNone(result)
+            self.assertEqual(result[2], [])
+            self.assertIsNone(load_resumable_task(raw, "changed", task, manifest, self.schema, set(self.schema["trainable_event_classes"])))
+            write_json(raw, {"task_fingerprint": "match", "parsed": {"contains_action": False, "events": []}})
+            self.assertIsNone(load_resumable_task(raw, "match", task, manifest, self.schema, set(self.schema["trainable_event_classes"])))
 
     def test_qwen_assessment_coverage_counts_explicit_no_action_windows(self) -> None:
         rows = [

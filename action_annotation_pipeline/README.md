@@ -61,6 +61,9 @@ The complete audit ledger is
 incomplete JSON is retried once and then recorded as a failed window. Hybrid
 diagnostics fail when dense assessment coverage is incomplete. Raw prompts,
 responses, crop coverage and normalized IDs remain in `proposals/raw/qwen/`.
+Successful action and explicit no-action windows are fingerprinted and reused
+after an interrupted run; stale, failed, or invalid records are recomputed.
+`summary.json` reports `resumed_tasks` and `new_tasks_processed`.
 
 Open the generated `review/annotate.html` for the dependency-free reviewer, or
 install FiftyOne and add `--launch`. Closing the FiftyOne session writes
