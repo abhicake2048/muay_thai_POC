@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import statistics
 import sys
 from collections import Counter, defaultdict
 from pathlib import Path
@@ -27,6 +28,27 @@ def _limb_group(row: dict[str, Any]) -> str:
     return "unknown"
 
 
+def _task_id(row: dict[str, Any]) -> str:
+    provenance = row.get("provenance", {})
+    return str(provenance.get("task_id", "")) if isinstance(provenance, dict) else ""
+
+
+def _coalesce_pose_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Prevent pose_attributes from voting twice for its source actionness row."""
+    selected: dict[str, dict[str, Any]] = {}
+    passthrough: list[dict[str, Any]] = []
+    for row in rows:
+        branch = str(row.get("proposal_branch", ""))
+        event_id = str(row.get("event_id", ""))
+        if not event_id or branch not in {"pose_actionness", "pose_attributes"}:
+            passthrough.append(row)
+            continue
+        current = selected.get(event_id)
+        if current is None or branch == "pose_attributes":
+            selected[event_id] = row
+    return [*passthrough, *selected.values()]
+
+
 def _compatible(left: dict[str, Any], right: dict[str, Any], iou_threshold: float = 0.30) -> bool:
     left_group, right_group = _limb_group(left), _limb_group(right)
     if left_group != "unknown" and right_group != "unknown" and left_group != right_group:
@@ -40,18 +62,29 @@ def _compatible(left: dict[str, Any], right: dict[str, Any], iou_threshold: floa
             return False
     peak_difference = abs(float(left.get("peak_sec", 0)) - float(right.get("peak_sec", 0)))
     left_branch, right_branch = str(left.get("proposal_branch", "")), str(right.get("proposal_branch", ""))
-    # Two independently localized visual events at distinct peaks are a
-    # combination, even when their broad context windows overlap heavily.
-    if left_branch == right_branch == "qwen_actions" and peak_difference >= 0.18:
-        return False
+    qwen_branches = {"qwen_actions", "qwen3_vl"}
+    if left_branch in qwen_branches and right_branch in qwen_branches:
+        # Multiple events returned by one VLM task are an intentional
+        # combination. Across overlapping scan tasks, only nearly identical
+        # peaks are duplicate observations of the same event.
+        left_task, right_task = _task_id(left), _task_id(right)
+        if left_task and left_task == right_task:
+            return peak_difference < 0.18 and temporal_iou(left, right) >= iou_threshold
+        if not left_task and not right_task and peak_difference >= 0.18:
+            return False
+        left_technique = str(left.get("technique", "unknown_action"))
+        right_technique = str(right.get("technique", "unknown_action"))
+        if left_technique not in UNKNOWN and right_technique not in UNKNOWN and left_technique != right_technique:
+            return False
+        return peak_difference <= 0.25 and temporal_iou(left, right) >= iou_threshold
     return temporal_iou(left, right) >= iou_threshold or peak_difference <= 0.15
 
 
 def _cluster_compatible(cluster: list[dict[str, Any]], row: dict[str, Any], iou_threshold: float) -> bool:
     if str(row.get("proposal_branch", "")) in {"qwen_actions", "qwen3_vl"}:
-        for member in cluster:
-            if str(member.get("proposal_branch", "")) in {"qwen_actions", "qwen3_vl"} and abs(float(member.get("peak_sec", 0)) - float(row.get("peak_sec", 0))) >= 0.18:
-                return False
+        qwen_members = [member for member in cluster if str(member.get("proposal_branch", "")) in {"qwen_actions", "qwen3_vl"}]
+        if qwen_members and not all(_compatible(member, row, iou_threshold) for member in qwen_members):
+            return False
     return any(_compatible(member, row, iou_threshold) for member in cluster)
 
 
@@ -147,6 +180,7 @@ def _vote(rows: list[dict[str, Any]], key: str, confidence_key: str = "proposal_
 
 
 def fuse(branch_rows: list[dict[str, Any]], schema: dict[str, Any], iou_threshold: float = 0.30) -> list[dict[str, Any]]:
+    branch_rows = _coalesce_pose_rows(branch_rows)
     clusters: list[list[dict[str, Any]]] = []
     ordered = sorted(branch_rows, key=lambda row: (int(row.get("actor_id", -1)), float(row.get("start_sec", 0))))
     for row in ordered:
@@ -160,10 +194,24 @@ def fuse(branch_rows: list[dict[str, Any]], schema: dict[str, Any], iou_threshol
         best = max(cluster, key=lambda row: float(row.get("proposal_confidence", 0.0)))
         fused = dict(best)
         fused["event_id"] = f"fused_{serial:06d}"
-        fused["start_sec"] = round(min(float(row["start_sec"]) for row in cluster), 6)
-        fused["end_sec"] = round(max(float(row["end_sec"]) for row in cluster), 6)
         peaks = sorted(float(row.get("peak_sec", 0.0)) for row in cluster)
         fused["peak_sec"] = round(peaks[len(peaks) // 2], 6)
+        action_starts = [float(row.get("action_start_sec", row["start_sec"])) for row in cluster]
+        action_ends = [float(row.get("action_end_sec", row["end_sec"])) for row in cluster]
+        action_start = min(float(fused["peak_sec"]), float(statistics.median(action_starts)))
+        action_end = max(float(fused["peak_sec"]), float(statistics.median(action_ends)))
+        if action_end <= action_start:
+            action_end = action_start + 1e-3
+        fused["start_sec"] = fused["action_start_sec"] = round(action_start, 6)
+        fused["end_sec"] = fused["action_end_sec"] = round(action_end, 6)
+        fused["context_start_sec"] = round(min(float(row.get("context_start_sec", row["start_sec"])) for row in cluster), 6)
+        fused["context_end_sec"] = round(max(float(row.get("context_end_sec", row["end_sec"])) for row in cluster), 6)
+        proxy_fps = float(best.get("proxy_fps", 0.0))
+        if proxy_fps > 0:
+            fused["proxy_fps"] = proxy_fps
+            fused["proxy_start_frame"] = int(round(action_start * proxy_fps))
+            fused["proxy_peak_frame"] = int(round(float(fused["peak_sec"]) * proxy_fps))
+            fused["proxy_end_frame"] = int(round(action_end * proxy_fps))
         field_confidence: dict[str, float] = {}
         for key in ("technique", "action_family", "anatomical_side", "effector_limb", "stance_at_start", "stance_role", "target_zone", "outcome", "contact_surface", "visibility"):
             confidence_key = "attribute_confidence" if key in {"anatomical_side", "effector_limb", "stance_role"} else "stance_confidence" if key == "stance_at_start" else "proposal_confidence"

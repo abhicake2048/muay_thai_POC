@@ -171,7 +171,10 @@ def _run_action_stages(
         [attributes],
         overwrite,
     )
-    branches = [actionness, attributes]
+    # pose_attributes is the enriched form of the same actionness events, not
+    # an independent classifier. Passing both branches gave every pose event
+    # two votes and produced duplicate evidence in the fused output.
+    branches = [attributes]
     if mode == "hybrid":
         if vlm_model is None:
             raise PipelineError("hybrid action mode requires --vlm-model")
@@ -257,17 +260,20 @@ def command_infer(args: argparse.Namespace) -> int:
     poses = project / "poses" / "poses.npz"
     common = ["--project", str(project), "--device", args.device]
     frame_args = ["--max-frames", str(args.max_frames)] if args.max_frames else []
-    _stage(project, "tracks", "extract_tracks.py", [*common, "--tracker", args.tracker, *frame_args], [proxy, Path(manifest["paths"]["yolo_weights"])], [tracks, fighter_map], args.overwrite)
+    track_args = [*common, "--tracker", args.tracker, *frame_args]
+    if args.refresh_fighter_map:
+        track_args.append("--replace-fighter-map")
+    _stage(project, "tracks", "extract_tracks.py", track_args, [proxy, Path(manifest["paths"]["yolo_weights"])], [tracks, fighter_map], args.overwrite)
     if args.sam2_config and args.sam2_checkpoint:
         sam2_output = project / "masks" / "sam2_masks.jsonl"
         sam2_args = ["--project", str(project), "--config", str(args.sam2_config.expanduser().resolve()), "--checkpoint", str(args.sam2_checkpoint.expanduser().resolve()), "--device", args.device, *frame_args]
         _stage(project, "sam2_masks", "sam2_masks.py", sam2_args, [proxy, tracks, fighter_map, args.sam2_config.expanduser().resolve(), args.sam2_checkpoint.expanduser().resolve()], [sam2_output], args.overwrite)
-    _stage(project, "poses", "extract_poses.py", [*common, *frame_args], [proxy, tracks, Path(manifest["paths"]["rtmpose_checkpoint"])], [poses], args.overwrite)
+    _stage(project, "poses", "extract_poses.py", [*common, *frame_args], [proxy, tracks, fighter_map, Path(manifest["paths"]["rtmpose_checkpoint"])], [poses], args.overwrite)
     for teacher_name, teacher_config, teacher_checkpoint in args.pose_teacher or []:
         safe_name = _slug(teacher_name)
         teacher_output = project / "poses" / "teachers" / f"{safe_name}.npz"
         teacher_args = [*common, *frame_args, "--config", str(Path(teacher_config).expanduser().resolve()), "--checkpoint", str(Path(teacher_checkpoint).expanduser().resolve()), "--output", str(teacher_output), "--overlay", str(project / "qa" / f"poses_{safe_name}_overlay.mp4"), "--metadata", str(project / "poses" / "teachers" / f"{safe_name}_metadata.json")]
-        _stage(project, f"pose_teacher_{safe_name}", "extract_poses.py", teacher_args, [proxy, tracks, Path(teacher_config).expanduser().resolve(), Path(teacher_checkpoint).expanduser().resolve()], [teacher_output], args.overwrite)
+        _stage(project, f"pose_teacher_{safe_name}", "extract_poses.py", teacher_args, [proxy, tracks, fighter_map, Path(teacher_config).expanduser().resolve(), Path(teacher_checkpoint).expanduser().resolve()], [teacher_output], args.overwrite)
     action_mode = "hybrid" if args.profile == "full" and args.vlm_model else "pose"
     fused = _run_action_stages(
         project,
@@ -442,6 +448,11 @@ def build_parser() -> argparse.ArgumentParser:
     infer.add_argument("--vlm-limit", type=int, default=0)
     infer.add_argument("--max-frames", type=int, default=0, help="Smoke tests only")
     infer.add_argument("--overwrite", action="store_true")
+    infer.add_argument(
+        "--refresh-fighter-map",
+        action="store_true",
+        help="Replace a reviewed/modified fighter map after creating a backup",
+    )
     infer.set_defaults(func=command_infer)
 
     actions = subparsers.add_parser("actions", help="Run only action proposal, classification, fusion and diagnostics stages")

@@ -30,6 +30,20 @@ python mtdata.py actions generated/action_annotations_v2/sparring_1 `
 Inspect `qa/action_diagnostics.json` and `qa/action_timeline.html`. Automatic
 labels remain proposals until a person verifies them.
 
+Projects created by an earlier build should refresh the canonical identity map
+once. The existing map is backed up before replacement, then RTMPose is rerun
+so every pose row contains a canonical `fighter_id`:
+
+```powershell
+python mtdata.py infer generated/action_annotations_v2/sparring_1 `
+  --device cuda:0 --refresh-fighter-map --overwrite
+```
+
+The action stage now uses component-first temporal segmentation (one interval
+per motion component), ordered Qwen video input at 8 FPS, actor-crop coverage
+checks, and cross-window duplicate fusion. Check the generated Qwen preview
+contact sheets and `proposals/raw/qwen/summary.json` before review.
+
 Open the generated `review/annotate.html` for the dependency-free reviewer, or
 install FiftyOne and add `--launch`. After exporting reviewed JSONL:
 

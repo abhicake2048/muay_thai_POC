@@ -71,6 +71,17 @@ After a short `--max-frames` smoke test, a later full tracking run refreshes an
 automatic fighter map to the full duration. A verified or manually edited map
 is preserved and must be extended by its reviewer when incomplete.
 
+The current tracker output contains both the raw tracker ID and a stitched
+canonical `fighter_id` on each selected detection. RTMPose saves that canonical
+identity with every skeleton and PoseC3D export uses it directly. This prevents
+raw-ID fragmentation from swapping actor/opponent slots. To deliberately
+replace an older verified or modified map, use `--refresh-fighter-map`; the old
+map is saved as a timestamped backup:
+
+```powershell
+python mtdata.py infer PROJECT --device cuda:0 --refresh-fighter-map --overwrite
+```
+
 For a pilot tracker bakeoff, export candidate JSONL files from BoT-SORT,
 DeepOCSORT/OccluBoost and the simple baseline, review a short gold JSONL, then
 run:
@@ -154,10 +165,21 @@ python mtdata.py infer generated/action_annotations_v2/sparring_1 `
   --profile full --vlm-model models/Qwen3-VL-8B-Instruct --device cuda:0
 ```
 
-The VLM sees three-second actor-centric composite clips at 6 FPS. Hybrid mode
+The VLM sees three-second actor-centric composite clips at 8 FPS. The ordered
+frames are passed through Qwen's native video input rather than as unrelated
+still images. Every sampled frame must contain the requested canonical actor;
+windows with less than 60% actor-crop coverage are rejected instead of being
+classified against the wrong fighter. Hybrid mode
 classifies every pose-actionness candidate and scans uncovered time at a
 1.5-second hop. It can return zero or multiple actions per window. Structured
-JSON, raw responses, parse failures, and per-branch evidence are retained.
+JSON, raw responses, parse failures, crop statistics, preview contact sheets,
+valid zero-event counts, and per-branch evidence are retained.
+
+Candidate windows are grouped before Qwen inference. Pose motion is segmented
+component-first, so several numerical peaks within one strike no longer create
+identical intervals. A component is split only when separated peaks have a
+sustained valley, preserving fast combinations. `pose_attributes` enriches the
+pose event and is not counted as an independent second vote during fusion.
 
 Run only the action stages, reusing existing tracks and poses:
 
@@ -213,6 +235,18 @@ python mtdata.py export PROJECT --allow-partial
 - technique class label;
 - anatomical-side, stance-role, target-zone and outcome label IDs;
 - masks that remove unknown/not-applicable attributes from auxiliary losses.
+
+Canonical action intervals contain `start_sec`, `peak_sec`, `end_sec` and their
+30 FPS proxy-frame equivalents. Context is stored separately and added by the
+PoseC3D exporter; it is never written into TriDet ground-truth boundaries.
+Probable duplicate verified events are rejected before export.
+
+`augmentation_policy.json` defines safe training-time skeleton augmentation:
+small temporal jitter/speed changes, scale/rotation/translation, keypoint noise,
+and light joint dropout. Apply it only after source-video splitting and only to
+the training split. Horizontal flipping is disabled by default because it can
+corrupt anatomical-side and stance-role supervision unless those semantics are
+updated in lockstep.
 
 `factorized_head.py` supplies the masked PyTorch multi-task head contract. The
 standard technique label remains compatible with an ordinary PoseC3D head.
@@ -284,3 +318,9 @@ not require Qwen, SAM2, BoxMOT, FiftyOne, Sapiens or RTMW to remain usable.
 
 Use `pipeline_state.sqlite3`, `logs/`, and `mtdata status` to diagnose a failed
 stage. A repaired stage resumes without repeating current predecessors.
+
+`qa/action_diagnostics.json` now fails closed for incomplete fighter mapping,
+truncated timelines, high exact-duplicate rates, or a hybrid Qwen run that
+processed windows but produced no normalized events. In that last case inspect
+`proposals/raw/qwen/summary.json`, individual task JSON, and
+`proposals/raw/qwen/previews/` rather than treating an empty JSONL as success.

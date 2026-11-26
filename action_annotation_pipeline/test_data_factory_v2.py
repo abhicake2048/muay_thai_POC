@@ -13,8 +13,9 @@ sys.path.insert(0, str(PIPELINE_ROOT))
 
 from aggregate_dataset import freeze  # noqa: E402
 from common import read_json, write_json, write_jsonl  # noqa: E402
-from action_signals import fighter_map_coverage  # noqa: E402
+from action_signals import action_components, fighter_map_coverage  # noqa: E402
 from extract_tracks import _was_automatic_map  # noqa: E402
+from fighter_identity import stitch_fighter_tracks  # noqa: E402
 from fuse_proposals import fuse  # noqa: E402
 from schema import canonicalize_event, display_label  # noqa: E402
 from state import StageState, stage_signature  # noqa: E402
@@ -87,6 +88,40 @@ class DataFactoryV2Tests(unittest.TestCase):
         self.assertEqual({task["actor_id"] for task in tasks}, {0, 1})
         self.assertTrue(all(task["kind"] == "dense" for task in tasks))
 
+    def test_candidate_vlm_windows_are_grouped_before_model_inference(self) -> None:
+        rows = [
+            {"event_id": f"p{index}", "actor_id": 0, "peak_sec": peak, "proposal_confidence": 0.8}
+            for index, peak in enumerate((1.0, 1.1, 1.35))
+        ]
+        tasks = build_scan_tasks(rows, 5.0, 2, 3.0, 1.5, "candidates")
+        self.assertEqual(len(tasks), 1)
+        self.assertEqual(len(tasks[0]["source_event_ids"]), 3)
+
+    def test_component_first_segmentation_removes_duplicate_peak_intervals(self) -> None:
+        noisy_single = np.asarray([0, 0, 0.9, 2.5, 1.4, 2.2, 0.9, 0.9, 0, 0], dtype=np.float32)
+        self.assertEqual(len(action_components(noisy_single, 2.0, 0.75, 2)), 1)
+        true_pair = np.asarray([0, 0, 0.9, 2.5, 0.8, 0.8, 2.4, 0.9, 0, 0], dtype=np.float32)
+        self.assertEqual(len(action_components(true_pair, 2.0, 0.75, 2)), 2)
+
+    def test_fighter_identity_stitches_raw_id_fragments_and_ignores_bystander(self) -> None:
+        records = []
+        for frame in range(6):
+            left_id = 10 if frame < 3 else 50
+            records.append({
+                "frame_index": frame,
+                "timestamp": frame / 30.0,
+                "detections": [
+                    {"track_id": left_id, "bbox_xyxy": [100 + frame, 80, 300 + frame, 650], "confidence": 0.95},
+                    {"track_id": 20, "bbox_xyxy": [800 - frame, 80, 1000 - frame, 650], "confidence": 0.94},
+                    {"track_id": 99, "bbox_xyxy": [10, 10, 40, 80], "confidence": 0.70},
+                ],
+            })
+        fighters, report = stitch_fighter_tracks(records, 1280, 720, 30.0)
+        self.assertEqual(report["raw_track_ids_by_fighter"]["0"], [10, 50])
+        self.assertEqual(report["raw_track_ids_by_fighter"]["1"], [20])
+        self.assertEqual(report["unassigned_detections"], 6)
+        self.assertGreaterEqual(len(fighters[0]["track_segments"]), 2)
+
     def test_vlm_window_can_return_multiple_actions(self) -> None:
         payload = {"events": [
             {"start_offset_sec": 0.2, "peak_offset_sec": 0.4, "end_offset_sec": 0.7, "technique": "jab", "confidence": 0.8, "anatomical_side": "left", "effector_limb": "hand"},
@@ -133,6 +168,24 @@ class DataFactoryV2Tests(unittest.TestCase):
         ]
         output = fuse(rows, self.schema)
         self.assertEqual(len(output), 2)
+
+    def test_fusion_merges_same_qwen_event_from_overlapping_scan_windows(self) -> None:
+        base = {"actor_id": 0, "target_id": 1, "start_sec": 1.0, "end_sec": 1.5, "event_type": "action", "review_status": "proposed", "anatomical_side": "left", "effector_limb": "hand", "proposal_branch": "qwen_actions", "proposal_confidence": 0.9, "technique": "jab"}
+        rows = [
+            {**base, "event_id": "window1", "peak_sec": 1.22, "provenance": {"task_id": "dense_1"}},
+            {**base, "event_id": "window2", "peak_sec": 1.25, "provenance": {"task_id": "dense_2"}},
+        ]
+        self.assertEqual(len(fuse(rows, self.schema)), 1)
+
+    def test_pose_attributes_do_not_double_vote_with_source_actionness(self) -> None:
+        base = {"event_id": "same", "actor_id": 0, "target_id": 1, "start_sec": 1.0, "peak_sec": 1.2, "end_sec": 1.4, "event_type": "action", "review_status": "proposed", "technique": "unknown_action", "effector_limb": "hand", "anatomical_side": "left", "proposal_confidence": 0.8}
+        output = fuse([
+            {**base, "proposal_branch": "pose_actionness"},
+            {**base, "proposal_branch": "pose_attributes", "stance_at_start": "orthodox"},
+        ], self.schema)
+        self.assertEqual(len(output), 1)
+        self.assertEqual(len(output[0]["branch_evidence"]), 1)
+        self.assertEqual(output[0]["branch_evidence"][0]["branch"], "pose_attributes")
 
     def test_fusion_preserves_different_pose_effectors_at_same_time(self) -> None:
         base = {"actor_id": 0, "target_id": 1, "start_sec": 1.0, "peak_sec": 1.3, "end_sec": 1.6, "event_type": "action", "review_status": "proposed", "technique": "unknown_action", "proposal_branch": "pose_actionness", "proposal_confidence": 0.8}
@@ -183,7 +236,9 @@ class DataFactoryV2Tests(unittest.TestCase):
                 sample = {"frame_dir": f"video{index}__sample", "label": 0}
                 with (project / "exports" / "posec3d" / "posec3d_annotations.pkl").open("wb") as handle:
                     pickle.dump({"split": {"train": [sample["frame_dir"]]}, "annotations": [sample]}, handle)
-                write_json(project / "exports" / "tridet" / "annotations.json", {"database": {f"video{index}__fighter0": {"source_video": f"video{index}", "annotations": []}}})
+                write_json(project / "exports" / "posec3d" / "class_map.json", {"classes": ["jab"]})
+                write_json(project / "exports" / "posec3d" / "augmentation_policy.json", {"apply_at_training_time_only": True})
+                write_json(project / "exports" / "tridet" / "annotations.json", {"taxonomy": ["jab"], "database": {f"video{index}__fighter0": {"source_video": f"video{index}", "annotations": []}}})
             report = freeze(root, Path(temporary) / "frozen", 42)
             self.assertEqual(report["leakage_check"], "passed")
             assigned = [video for split in report["splits"].values() for video in split]

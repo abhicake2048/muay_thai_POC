@@ -12,12 +12,12 @@ from typing import Any
 import numpy as np
 
 from action_signals import (
+    action_components,
     build_fighter_timelines,
     compute_action_signals,
     family_candidates,
     fighter_map_coverage,
     hysteresis_bounds,
-    local_peaks,
     require_fighter_map_coverage,
 )
 from common import PipelineError, load_fighter_map, load_manifest, write_json, write_jsonl
@@ -59,10 +59,15 @@ def _event(
     duration: float,
     pre_seconds: float,
     post_seconds: float,
+    component_id: str,
+    subaction_index: int,
 ) -> dict[str, Any]:
     peak_sec = peak / fps
-    action_start = onset / fps
-    action_end = offset / fps
+    # Store physical action boundaries in the canonical interval. Context is
+    # retained separately for VLM/PoseC3D clip construction and must not leak
+    # into TriDet ground-truth segments.
+    action_start = max(0.0, (onset - 0.5) / fps)
+    action_end = min(duration, (offset + 0.5) / fps)
     families, limb, family_hint = family_candidates(signal, peak)
     target_zone, target_evidence = _target_zone(signal, peak)
     side = str(signal["side"])
@@ -73,11 +78,17 @@ def _event(
         "event_type": "action",
         "actor_id": actor,
         "target_id": 1 - actor if actor in (0, 1) else -1,
-        "start_sec": round(max(0.0, action_start - pre_seconds), 6),
+        "start_sec": round(action_start, 6),
         "peak_sec": round(peak_sec, 6),
-        "end_sec": round(min(duration, action_end + post_seconds), 6),
+        "end_sec": round(action_end, 6),
         "action_start_sec": round(action_start, 6),
         "action_end_sec": round(action_end, 6),
+        "context_start_sec": round(max(0.0, action_start - pre_seconds), 6),
+        "context_end_sec": round(min(duration, action_end + post_seconds), 6),
+        "proxy_fps": fps,
+        "proxy_start_frame": int(round(action_start * fps)),
+        "proxy_peak_frame": int(peak),
+        "proxy_end_frame": int(round(action_end * fps)),
         "label": "unknown_action",
         "technique": "unknown_action",
         "technique_candidates": [],
@@ -113,6 +124,8 @@ def _event(
         "provenance": {
             "source": "pose_actionness",
             "effector": effector_name,
+            "motion_component_id": component_id,
+            "subaction_index": subaction_index,
             "peak_frame": peak,
             "evidence": {
                 "raw_score": round(float(signal["raw"][peak]), 6),
@@ -151,6 +164,8 @@ def generate_proposals(
         np.asarray(data["timestamps"]),
         np.asarray(data["track_ids"]),
         expected,
+        canonical_fighters=np.asarray(data["fighter_ids"])
+        if "fighter_ids" in (set(data.files) if hasattr(data, "files") else set(data.keys())) else None,
     )
     require_fighter_map_coverage(coverage)
     timelines, timeline_report = build_fighter_timelines(
@@ -170,28 +185,46 @@ def generate_proposals(
         signals = compute_action_signals(timeline, opponent, fps)
         signal_summary[str(actor)] = {}
         for effector_name, signal in signals.items():
-            peaks = local_peaks(signal["actionness"], high_threshold, separation_frames)
-            peaks = [peak for peak in peaks if float(signal["distal_speed"][peak]) >= minimum_physical_speed]
+            components = action_components(
+                signal["actionness"], high_threshold, low_threshold, separation_frames
+            )
+            components = [
+                component for component in components
+                if float(signal["distal_speed"][component[0]]) >= minimum_physical_speed
+            ]
             # A low-variance sequence can make a strict robust threshold too
             # conservative. Keep one physically meaningful fallback peak so
             # the reviewer sees evidence instead of a silent empty file.
-            if not peaks and len(signal["raw"]) > 2:
+            if not components and len(signal["raw"]) > 2:
                 fallback = int(np.argmax(signal["raw"]))
                 if 0 < fallback < len(signal["raw"]) - 1 and float(signal["distal_speed"][fallback]) >= minimum_physical_speed:
-                    peaks = [fallback]
+                    onset, offset = hysteresis_bounds(signal["actionness"], fallback, low_threshold)
+                    components = [(fallback, onset, offset)]
             signal_summary[str(actor)][effector_name] = {
-                "peaks": len(peaks),
+                "components": len(components),
                 "maximum_actionness": round(float(np.max(signal["actionness"])), 6),
                 "maximum_raw_score": round(float(np.max(signal["raw"])), 6),
                 "statistics": signal["statistics"],
             }
-            for peak in peaks:
-                onset, offset = hysteresis_bounds(signal["actionness"], peak, low_threshold)
+            for component_index, (peak, onset, offset) in enumerate(components):
+                component_id = f"fighter{actor}:{effector_name}:{onset}-{offset}"
                 proposals.append(_event(
                     serial, manifest, actor, effector_name, signal, peak, onset, offset,
-                    fps, duration, pre_seconds, post_seconds,
+                    fps, duration, pre_seconds, post_seconds, component_id, component_index,
                 ))
                 serial += 1
+    deduplicated: dict[tuple[int, str, float, float], dict[str, Any]] = {}
+    for proposal in proposals:
+        key = (
+            int(proposal["actor_id"]),
+            str(proposal["pose_effector_id"]),
+            round(float(proposal["action_start_sec"]), 4),
+            round(float(proposal["action_end_sec"]), 4),
+        )
+        current = deduplicated.get(key)
+        if current is None or float(proposal["actionness_score"]) > float(current["actionness_score"]):
+            deduplicated[key] = proposal
+    proposals = list(deduplicated.values())
     proposals.sort(key=lambda row: (float(row["start_sec"]), int(row["actor_id"]), float(row["peak_sec"])))
     report = {"coverage": coverage, "timeline": timeline_report, "signals": signal_summary, "proposal_count": len(proposals)}
     return proposals, report

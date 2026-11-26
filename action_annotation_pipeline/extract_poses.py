@@ -13,7 +13,14 @@ from typing import Any, Iterator
 import cv2
 import numpy as np
 
-from common import PipelineError, load_manifest, read_jsonl, write_json
+from common import (
+    PipelineError,
+    canonical_fighter_for_track,
+    load_fighter_map,
+    load_manifest,
+    read_jsonl,
+    write_json,
+)
 
 
 os.environ.setdefault("MPLBACKEND", "Agg")
@@ -69,11 +76,11 @@ def padded_box(box: list[float], width: int, height: int, padding: float) -> lis
     return [max(0.0, x1 - dx), max(0.0, y1 - dy), min(float(width - 1), x2 + dx), min(float(height - 1), y2 + dy)]
 
 
-def draw_pose(frame: np.ndarray, track_id: int, box: np.ndarray, points: np.ndarray, scores: np.ndarray, threshold: float) -> None:
-    color = COLORS[abs(track_id) % len(COLORS)]
+def draw_pose(frame: np.ndarray, fighter_id: int, track_id: int, box: np.ndarray, points: np.ndarray, scores: np.ndarray, threshold: float) -> None:
+    color = COLORS[abs(fighter_id) % len(COLORS)]
     x1, y1, x2, y2 = [int(round(value)) for value in box]
     cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-    cv2.putText(frame, f"raw track {track_id}", (x1, max(22, y1 - 7)), cv2.FONT_HERSHEY_SIMPLEX, 0.52, color, 2, cv2.LINE_AA)
+    cv2.putText(frame, f"fighter {fighter_id} / raw {track_id}", (x1, max(22, y1 - 7)), cv2.FONT_HERSHEY_SIMPLEX, 0.52, color, 2, cv2.LINE_AA)
     for start, end in COCO_LINKS:
         if scores[start] >= threshold and scores[end] >= threshold:
             cv2.line(frame, tuple(np.rint(points[start]).astype(int)), tuple(np.rint(points[end]).astype(int)), color, 2, cv2.LINE_AA)
@@ -94,6 +101,7 @@ def main() -> int:
         config = args.config.expanduser().resolve() if args.config else Path(manifest["paths"]["rtmpose_config"])
         checkpoint = args.checkpoint.expanduser().resolve() if args.checkpoint else Path(manifest["paths"]["rtmpose_checkpoint"])
         tracks_path = project / "tracks" / "tracks.jsonl"
+        fighter_map = load_fighter_map(project)
         output_path = args.output.expanduser().resolve() if args.output else project / "poses" / "poses.npz"
         overlay_path = args.overlay.expanduser().resolve() if args.overlay else project / "qa" / "poses_overlay.mp4"
         metadata_path = args.metadata.expanduser().resolve() if args.metadata else project / "poses" / "metadata.json"
@@ -135,12 +143,15 @@ def main() -> int:
         instance_frames: list[int] = []
         timestamps: list[float] = []
         track_ids: list[int] = []
+        fighter_ids: list[int] = []
         bboxes: list[np.ndarray] = []
         bbox_scores: list[float] = []
         keypoints: list[np.ndarray] = []
         keypoint_scores: list[np.ndarray] = []
         frame_index = 0
         threshold = float(manifest.get("thresholds", {}).get("keypoint_confidence", 0.2))
+        discarded_unmapped_detections = 0
+        discarded_duplicate_fighter_detections = 0
         try:
             while True:
                 ok, frame = capture.read()
@@ -148,7 +159,27 @@ def main() -> int:
                     break
                 if args.max_frames and frame_index >= args.max_frames:
                     break
-                detections = tracks_by_frame.get(frame_index, [])
+                raw_detections = tracks_by_frame.get(frame_index, [])
+                timestamp = frame_index / fps
+                selected: dict[int, dict[str, Any]] = {}
+                for detection in raw_detections:
+                    fighter = detection.get("fighter_id")
+                    if fighter is None:
+                        fighter = canonical_fighter_for_track(
+                            fighter_map,
+                            int(detection["track_id"]),
+                            timestamp,
+                        )
+                    if fighter is None or int(fighter) < 0:
+                        discarded_unmapped_detections += 1
+                        continue
+                    fighter = int(fighter)
+                    previous = selected.get(fighter)
+                    if previous is not None:
+                        discarded_duplicate_fighter_detections += 1
+                    if previous is None or float(detection.get("confidence", 0.0)) > float(previous.get("confidence", 0.0)):
+                        selected[fighter] = detection
+                detections = [selected[fighter] for fighter in sorted(selected)]
                 boxes = [padded_box(list(det["bbox_xyxy"]), width, height, args.bbox_padding) for det in detections]
                 if boxes:
                     samples = inference_topdown(model, frame, bboxes=np.asarray(boxes, dtype=np.float32), bbox_format="xyxy")
@@ -160,14 +191,21 @@ def main() -> int:
                         else:
                             scores = np.ones(points.shape[0], dtype=np.float32)
                         track_id = int(detection["track_id"])
+                        fighter_value = detection.get("fighter_id")
+                        if fighter_value is None:
+                            fighter_value = canonical_fighter_for_track(fighter_map, track_id, timestamp)
+                        if fighter_value is None:
+                            continue
+                        fighter_id = int(fighter_value)
                         instance_frames.append(frame_index)
-                        timestamps.append(frame_index / fps)
+                        timestamps.append(timestamp)
                         track_ids.append(track_id)
+                        fighter_ids.append(fighter_id)
                         bboxes.append(np.asarray(box, dtype=np.float32))
                         bbox_scores.append(float(detection.get("confidence", 1.0)))
                         keypoints.append(points)
                         keypoint_scores.append(scores)
-                        draw_pose(frame, track_id, np.asarray(box), points, scores, threshold)
+                        draw_pose(frame, fighter_id, track_id, np.asarray(box), points, scores, threshold)
                 cv2.putText(frame, f"frame {frame_index}  {frame_index/fps:.3f}s", (12, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.62, (255, 255, 255), 2, cv2.LINE_AA)
                 writer.write(frame)
                 frame_index += 1
@@ -184,6 +222,7 @@ def main() -> int:
             frame_indices=np.asarray(instance_frames, dtype=np.int32),
             timestamps=np.asarray(timestamps, dtype=np.float64),
             track_ids=np.asarray(track_ids, dtype=np.int32),
+            fighter_ids=np.asarray(fighter_ids, dtype=np.int16),
             bboxes_xyxy=np.asarray(bboxes, dtype=np.float32),
             bbox_scores=np.asarray(bbox_scores, dtype=np.float32),
             keypoints=np.asarray(keypoints, dtype=np.float32),
@@ -193,6 +232,9 @@ def main() -> int:
             "instances": len(keypoints), "processed_frames": frame_index, "fps": fps,
             "width": width, "height": height, "device": str(device),
             "config": str(config), "checkpoint": str(checkpoint), "bbox_padding": args.bbox_padding,
+            "canonical_fighters_only": True,
+            "discarded_unmapped_detections": discarded_unmapped_detections,
+            "discarded_duplicate_fighter_detections": discarded_duplicate_fighter_detections,
         })
         print(json.dumps({"instances": len(keypoints), "frames": frame_index, "poses": str(output_path), "overlay": str(overlay_path)}, indent=2))
         return 0

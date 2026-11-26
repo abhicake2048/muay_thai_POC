@@ -11,7 +11,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from common import PipelineError, read_json, write_json
+from common import PipelineError, read_json, read_jsonl, write_json, write_jsonl
 
 
 def discover_projects(root: Path) -> list[Path]:
@@ -39,7 +39,12 @@ def freeze(root: Path, output: Path, seed: int) -> dict[str, Any]:
     splits = split_groups([str(value["video_id"]) for value in manifests.values()], seed)
     source_to_split = {video: split for split, videos in splits.items() for video in videos}
     pose_annotations, pose_split = [], {"train": [], "val": [], "test": []}
+    pose_metadata: list[dict[str, Any]] = []
     tridet_database: dict[str, Any] = {}
+    canonical_class_map: dict[str, Any] | None = None
+    canonical_augmentation: dict[str, Any] | None = None
+    tridet_taxonomy: list[str] | None = None
+    tridet_metadata: dict[str, Any] | None = None
     missing = []
     for project, manifest in manifests.items():
         video_id = str(manifest["video_id"])
@@ -55,7 +60,28 @@ def freeze(root: Path, output: Path, seed: int) -> dict[str, Any]:
             sample_id = str(annotation["frame_dir"])
             pose_annotations.append(annotation)
             pose_split[split].append(sample_id)
+        class_map_path = project / "exports" / "posec3d" / "class_map.json"
+        augmentation_path = project / "exports" / "posec3d" / "augmentation_policy.json"
+        if not class_map_path.is_file() or not augmentation_path.is_file():
+            raise PipelineError(f"PoseC3D class/augmentation contract is missing for {video_id}; re-export the project")
+        class_map = read_json(class_map_path)
+        augmentation = read_json(augmentation_path)
+        if canonical_class_map is not None and class_map != canonical_class_map:
+            raise PipelineError(f"PoseC3D class map differs in project {video_id}")
+        if canonical_augmentation is not None and augmentation != canonical_augmentation:
+            raise PipelineError(f"PoseC3D augmentation policy differs in project {video_id}")
+        canonical_class_map = class_map
+        canonical_augmentation = augmentation
+        metadata_path = project / "exports" / "posec3d" / "sample_metadata.jsonl"
+        for row in read_jsonl(metadata_path) if metadata_path.is_file() else []:
+            pose_metadata.append({**row, "split": split, "source_group": video_id})
         tri_payload = read_json(tridet_path)
+        taxonomy = list(tri_payload.get("taxonomy", []))
+        if tridet_taxonomy is not None and taxonomy != tridet_taxonomy:
+            raise PipelineError(f"TriDet taxonomy differs in project {video_id}")
+        tridet_taxonomy = taxonomy
+        if tridet_metadata is None:
+            tridet_metadata = dict(tri_payload.get("metadata", {}))
         for stream_id, record in tri_payload["database"].items():
             value = dict(record)
             value["subset"] = {"train": "training", "val": "validation", "test": "testing"}[split]
@@ -65,7 +91,15 @@ def freeze(root: Path, output: Path, seed: int) -> dict[str, Any]:
     output.mkdir(parents=True, exist_ok=True)
     with (output / "posec3d_annotations.pkl").open("wb") as handle:
         pickle.dump({"split": pose_split, "annotations": pose_annotations}, handle, protocol=pickle.HIGHEST_PROTOCOL)
-    write_json(output / "tridet_annotations.json", {"version": "muay_thai_actions_v2", "database": tridet_database})
+    write_json(output / "posec3d_class_map.json", canonical_class_map or {})
+    write_json(output / "posec3d_augmentation_policy.json", canonical_augmentation or {})
+    write_jsonl(output / "posec3d_sample_metadata.jsonl", pose_metadata)
+    write_json(output / "tridet_annotations.json", {
+        "version": "muay_thai_actions_v2",
+        "taxonomy": tridet_taxonomy or [],
+        "database": tridet_database,
+        "metadata": tridet_metadata or {},
+    })
     leakage = {video: split for video, split in source_to_split.items()}
     fingerprint = hashlib.sha256(json.dumps({"splits": splits, "pose_samples": len(pose_annotations), "streams": sorted(tridet_database)}, sort_keys=True).encode()).hexdigest()
     report = {"dataset_version": "1.0", "fingerprint": fingerprint, "seed": seed, "projects": len(projects), "posec3d_samples": len(pose_annotations), "tridet_streams": len(tridet_database), "source_splits": leakage, "splits": splits, "leakage_check": "passed"}

@@ -24,8 +24,9 @@ def fighter_map_coverage(
     raw_tracks: np.ndarray,
     expected_fighters: int,
     tolerance: float = 0.20,
+    canonical_fighters: np.ndarray | None = None,
 ) -> dict[str, Any]:
-    """Measure whether the canonical fighter map covers the pose timeline."""
+    """Measure nominal map span and actual pose-to-fighter assignment coverage."""
     pose_start = float(np.min(times)) if len(times) else 0.0
     pose_end = float(np.max(times)) if len(times) else 0.0
     intervals_by_fighter: dict[int, list[tuple[float, float]]] = defaultdict(list)
@@ -52,7 +53,6 @@ def fighter_map_coverage(
             and end is not None
             and start <= pose_start + tolerance
             and end >= pose_end - tolerance
-            and not gaps
         )
         fighters.append({
             "fighter_id": fighter_id,
@@ -64,20 +64,41 @@ def fighter_map_coverage(
 
     unmapped = 0
     mapped_by_fighter: dict[int, int] = defaultdict(int)
-    for timestamp, raw_track in zip(times, raw_tracks):
-        fighter = canonical_fighter_for_track(fighter_map, int(raw_track), float(timestamp))
+    observed_times: dict[int, list[float]] = defaultdict(list)
+    for index, (timestamp, raw_track) in enumerate(zip(times, raw_tracks)):
+        fighter = None
+        if canonical_fighters is not None and index < len(canonical_fighters):
+            canonical_value = int(canonical_fighters[index])
+            fighter = canonical_value if canonical_value >= 0 else None
+        if fighter is None:
+            fighter = canonical_fighter_for_track(fighter_map, int(raw_track), float(timestamp))
         if fighter is None:
             unmapped += 1
         else:
             mapped_by_fighter[int(fighter)] += 1
+            observed_times[int(fighter)].append(float(timestamp))
+    for row in fighters:
+        observed = observed_times.get(int(row["fighter_id"]), [])
+        row["observed_start_sec"] = min(observed) if observed else None
+        row["observed_end_sec"] = max(observed) if observed else None
+        row["mapped_pose_instances"] = len(observed)
+    mapped = max(0, int(len(times)) - unmapped)
+    mapped_ratio = mapped / max(1, int(len(times)))
+    complete = bool(
+        mapped_ratio >= 0.95
+        and all(item["covers_pose_span"] and item["mapped_pose_instances"] > 0 for item in fighters)
+    )
     return {
         "pose_start_sec": pose_start,
         "pose_end_sec": pose_end,
         "pose_instances": int(len(times)),
+        "mapped_pose_instances": mapped,
         "unmapped_pose_instances": int(unmapped),
+        "mapped_pose_ratio": round(mapped_ratio, 6),
+        "unmapped_pose_ratio": round(1.0 - mapped_ratio, 6),
         "mapped_instances_by_fighter": dict(sorted(mapped_by_fighter.items())),
         "fighters": fighters,
-        "complete": all(item["covers_pose_span"] for item in fighters),
+        "complete": complete,
         "map_review_status": fighter_map.get("review_status", "legacy_unknown"),
         "map_processed_end_sec": fighter_map.get("processed_end_sec"),
     }
@@ -93,7 +114,9 @@ def require_fighter_map_coverage(report: dict[str, Any]) -> None:
     raise PipelineError(
         "fighter_map.json does not cover the pose timeline "
         f"{report.get('pose_start_sec', 0):.3f}..{report.get('pose_end_sec', 0):.3f}s "
-        f"({details}). Re-run the tracks stage so an automatic map is refreshed, "
+        f"({details}); mapped pose ratio={float(report.get('mapped_pose_ratio', 0.0)):.3f}, "
+        f"unmapped instances={int(report.get('unmapped_pose_instances', 0))}. "
+        "Re-run tracking and RTMPose so canonical fighter stitching is applied, "
         "or review and extend a manually verified map."
     )
 
@@ -155,6 +178,8 @@ def build_fighter_timelines(
     frames = np.asarray(data["frame_indices"], dtype=np.int32)
     times = np.asarray(data["timestamps"], dtype=np.float64)
     raw_tracks = np.asarray(data["track_ids"], dtype=np.int32)
+    data_keys = set(data.files) if hasattr(data, "files") else set(data.keys())
+    canonical_fighters = np.asarray(data["fighter_ids"], dtype=np.int16) if "fighter_ids" in data_keys else None
     points = np.asarray(data["keypoints"], dtype=np.float32)
     scores = np.asarray(data["keypoint_scores"], dtype=np.float32)
     boxes = np.asarray(data["bboxes_xyxy"], dtype=np.float32)
@@ -176,7 +201,9 @@ def build_fighter_timelines(
 
     discarded = 0
     for index, frame in enumerate(frames):
-        fighter = canonical_fighter_for_track(fighter_map, int(raw_tracks[index]), float(times[index]))
+        fighter = int(canonical_fighters[index]) if canonical_fighters is not None else canonical_fighter_for_track(
+            fighter_map, int(raw_tracks[index]), float(times[index])
+        )
         if fighter is None or fighter not in timelines:
             discarded += 1
             continue
@@ -373,6 +400,74 @@ def hysteresis_bounds(values: np.ndarray, peak: int, low: float, below_frames: i
             right -= below_frames
             break
     return max(0, left), min(len(values) - 1, right)
+
+
+def action_components(
+    values: np.ndarray,
+    high: float,
+    low: float,
+    separation_frames: int,
+    *,
+    below_frames: int = 2,
+    split_valley: float = 1.10,
+) -> list[tuple[int, int, int]]:
+    """Return one ``(peak, onset, offset)`` tuple per physical action.
+
+    The previous implementation expanded every local peak independently.  If
+    several peaks belonged to the same hysteresis component it consequently
+    emitted the exact same interval two, three, or more times.  Components are
+    now formed first.  A component is split only when two sufficiently
+    separated peaks also have a sustained valley between them, which preserves
+    real combinations without multiplying noisy peaks from one strike.
+    """
+    values = np.asarray(values, dtype=np.float32)
+    if len(values) < 3:
+        return []
+    peaks = local_peaks(values, high, separation_frames)
+    if not peaks:
+        return []
+
+    bounds = sorted(hysteresis_bounds(values, peak, low, below_frames) for peak in peaks)
+    merged: list[list[int]] = []
+    for onset, offset in bounds:
+        if not merged or onset > merged[-1][1] + 1:
+            merged.append([onset, offset])
+        else:
+            merged[-1][1] = max(merged[-1][1], offset)
+
+    output: list[tuple[int, int, int]] = []
+    for component_onset, component_offset in merged:
+        candidates = [peak for peak in peaks if component_onset <= peak <= component_offset]
+        if not candidates:
+            candidates = [component_onset + int(np.argmax(values[component_onset:component_offset + 1]))]
+        candidates.sort()
+
+        selected = [candidates[0]]
+        for candidate in candidates[1:]:
+            previous = selected[-1]
+            valley = values[previous + 1:candidate]
+            sustained_valley = (
+                candidate - previous >= separation_frames
+                and len(valley) >= 2
+                and any(
+                    valley[index] <= split_valley and valley[index + 1] <= split_valley
+                    for index in range(len(valley) - 1)
+                )
+            )
+            if sustained_valley:
+                selected.append(candidate)
+            elif values[candidate] > values[previous]:
+                selected[-1] = candidate
+
+        split_frames = [
+            left + int(np.argmin(values[left:right + 1]))
+            for left, right in zip(selected[:-1], selected[1:])
+        ]
+        for index, peak in enumerate(selected):
+            onset = component_onset if index == 0 else split_frames[index - 1] + 1
+            offset = component_offset if index == len(selected) - 1 else split_frames[index]
+            output.append((peak, onset, offset))
+    return output
 
 
 def family_candidates(signal: dict[str, Any], peak: int) -> tuple[list[dict[str, Any]], str, str]:

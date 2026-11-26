@@ -20,6 +20,25 @@ def _rows(path: Path) -> list[dict[str, Any]]:
     return read_jsonl(path) if path.is_file() and path.stat().st_size else []
 
 
+def _duplicate_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    groups: Counter[tuple[Any, ...]] = Counter()
+    for row in rows:
+        groups[(
+            int(row.get("actor_id", -1)),
+            str(row.get("pose_effector_id", row.get("effector_id", "unknown"))),
+            round(float(row.get("action_start_sec", row.get("start_sec", 0.0))), 3),
+            round(float(row.get("action_end_sec", row.get("end_sec", 0.0))), 3),
+        )] += 1
+    duplicate_groups = [count for count in groups.values() if count > 1]
+    duplicate_rows = sum(count - 1 for count in duplicate_groups)
+    return {
+        "exact_duplicate_groups": len(duplicate_groups),
+        "exact_duplicate_rows": duplicate_rows,
+        "maximum_copies": max(duplicate_groups, default=1),
+        "duplicate_rate": round(duplicate_rows / max(len(rows), 1), 6),
+    }
+
+
 def _branch_summary(path: Path) -> dict[str, Any]:
     rows = _rows(path)
     peaks = [float(row.get("peak_sec", 0.0)) for row in rows]
@@ -30,6 +49,7 @@ def _branch_summary(path: Path) -> dict[str, Any]:
         "techniques": dict(Counter(str(row.get("technique", row.get("label", "unknown_action"))) for row in rows)),
         "first_peak_sec": min(peaks) if peaks else None,
         "last_peak_sec": max(peaks) if peaks else None,
+        "duplicates": _duplicate_summary(rows),
     }
 
 
@@ -46,6 +66,7 @@ def build_report(project: Path) -> dict[str, Any]:
         np.asarray(data["timestamps"]),
         np.asarray(data["track_ids"]),
         expected,
+        canonical_fighters=np.asarray(data["fighter_ids"]) if "fighter_ids" in data.files else None,
     )
     tracks = _rows(project / "tracks" / "tracks.jsonl")
     detection_counts = [len(row.get("detections", [])) for row in tracks]
@@ -61,20 +82,49 @@ def build_report(project: Path) -> dict[str, Any]:
         if str(evidence.get("branch", "")) in learned_names
     }
     warnings: list[str] = []
+    critical: list[str] = []
+    recommendations: list[str] = []
     if not coverage["complete"]:
-        warnings.append("fighter_map.json does not cover the pose timeline")
+        message = "fighter_map.json does not cover the pose timeline"
+        warnings.append(message)
+        critical.append(message)
+        recommendations.append("Re-run tracks and poses with the canonical fighter-identity stitcher before action discovery.")
     if coverage["unmapped_pose_instances"]:
         warnings.append(f"{coverage['unmapped_pose_instances']} pose instances are not mapped to a canonical fighter")
     if not fused:
-        warnings.append("no fused action proposals were produced")
+        message = "no fused action proposals were produced"
+        warnings.append(message)
+        critical.append(message)
     elif fused_peaks and max(fused_peaks) < coverage["pose_end_sec"] - 1.0:
-        warnings.append("proposals stop before the pose timeline ends")
+        message = "proposals stop before the pose timeline ends"
+        warnings.append(message)
+        critical.append(message)
     if fused and all(str(row.get("technique", "unknown_action")) == "unknown_action" for row in fused):
         warnings.append("all proposals are unknown_action; no successful technique classifier output was fused")
     if not classifier_branches:
         warnings.append("no technique-classifier branch ran; pose actionness can only suggest family/limb")
+    qwen_summary_path = project / "proposals" / "raw" / "qwen" / "summary.json"
+    qwen_summary = read_json(qwen_summary_path) if qwen_summary_path.is_file() else None
+    if qwen_summary and int(qwen_summary.get("tasks", 0)) > 0:
+        if int(qwen_summary.get("events", 0)) == 0:
+            message = "Qwen processed windows but produced zero normalized action events"
+            warnings.append(message)
+            critical.append(message)
+            recommendations.append("Inspect proposals/raw/qwen records and previews; check crop coverage, parse failures, and valid zero-event counts.")
+        if int(qwen_summary.get("failures", 0)):
+            warnings.append(
+                f"Qwen failed on {int(qwen_summary['failures'])}/{int(qwen_summary.get('tasks', 0))} tasks"
+            )
+    fused_duplicates = _duplicate_summary(fused)
+    if fused_duplicates["duplicate_rate"] > 0.15:
+        message = f"fused proposals have a high exact-duplicate rate ({fused_duplicates['duplicate_rate']:.1%})"
+        warnings.append(message)
+        critical.append(message)
+        recommendations.append("Re-run pose actionness and fusion with component-first segmentation; do not fuse pose_actionness and pose_attributes together.")
     pose_report_path = project / "qa" / "pose_actionness_report.json"
     pose_report = read_json(pose_report_path) if pose_report_path.is_file() else None
+    identity_report_path = project / "tracks" / "fighter_identity_report.json"
+    identity_report = read_json(identity_report_path) if identity_report_path.is_file() else None
     return {
         "project": str(project),
         "video_id": manifest["video_id"],
@@ -91,8 +141,10 @@ def build_report(project: Path) -> dict[str, Any]:
             "first_timestamp": coverage["pose_start_sec"],
             "last_timestamp": coverage["pose_end_sec"],
             "raw_tracks": sorted({int(value) for value in data["track_ids"]}),
+            "canonical_fighters": sorted({int(value) for value in data["fighter_ids"]}) if "fighter_ids" in data.files else [],
         },
         "fighter_map": {**coverage, "path": str(project / "tracks" / "fighter_map.json")},
+        "fighter_identity_stitching": identity_report,
         "branches": branches,
         "fused": {
             "rows": len(fused),
@@ -100,11 +152,15 @@ def build_report(project: Path) -> dict[str, Any]:
             "last_peak_sec": max(fused_peaks) if fused_peaks else None,
             "actors": dict(Counter(str(row.get("actor_id", -1)) for row in fused)),
             "techniques": dict(Counter(str(row.get("technique", "unknown_action")) for row in fused)),
+            "duplicates": fused_duplicates,
         },
         "technique_classifier": {"ran": bool(classifier_branches), "branches": sorted(classifier_branches)},
+        "qwen": qwen_summary,
         "pose_actionness": pose_report,
         "warnings": warnings,
-        "ok": not any("does not cover" in warning or "no fused" in warning for warning in warnings),
+        "critical_failures": critical,
+        "recommendations": list(dict.fromkeys(recommendations)),
+        "ok": not critical,
     }
 
 

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import re
 import sys
 from pathlib import Path
 from typing import Any
@@ -40,17 +39,38 @@ Return exactly one JSON object and no prose:
 Offsets are relative to the start of this window, in seconds. Boundaries must be ordered and inside the window.
 Do not invent contact or anatomical side. Predictions are proposals, not verified truth."""
 
+TECHNIQUE_ALIASES = {
+    "roundhouse": "roundhouse_kick",
+    "round_kick": "roundhouse_kick",
+    "low_kick": "roundhouse_kick",
+    "body_kick": "roundhouse_kick",
+    "head_kick": "roundhouse_kick",
+    "front_kick": "teep",
+    "push_kick": "teep",
+    "straight_punch": "cross",
+    "rear_straight": "cross",
+    "spinning_back_fist": "spinning_backfist",
+}
+
 
 def _json_object(text: str) -> dict[str, Any]:
-    match = re.search(r"\{.*\}", text, flags=re.DOTALL)
-    if not match:
-        raise ValueError("model output contained no JSON object")
-    value = json.loads(match.group(0))
-    if not isinstance(value, dict):
-        raise ValueError("model output JSON was not an object")
-    if not isinstance(value.get("events", []), list):
-        raise ValueError("model output events must be an array")
-    return value
+    decoder = json.JSONDecoder()
+    errors: list[str] = []
+    for index, character in enumerate(text):
+        if character != "{":
+            continue
+        try:
+            value, _ = decoder.raw_decode(text[index:])
+        except json.JSONDecodeError as exc:
+            errors.append(str(exc))
+            continue
+        if not isinstance(value, dict):
+            continue
+        if not isinstance(value.get("events", []), list):
+            raise ValueError("model output events must be an array")
+        return value
+    detail = f" ({errors[-1]})" if errors else ""
+    raise ValueError(f"model output contained no valid JSON object{detail}")
 
 
 def _letterbox(frame: np.ndarray, width: int, height: int) -> np.ndarray:
@@ -67,7 +87,7 @@ def _letterbox(frame: np.ndarray, width: int, height: int) -> np.ndarray:
 
 def _crop(frame: np.ndarray, box: list[float] | None, context: float = 0.35) -> np.ndarray:
     if box is None:
-        return frame
+        return np.zeros((max(1, frame.shape[0] // 2), max(1, frame.shape[1] // 2), 3), dtype=np.uint8)
     height, width = frame.shape[:2]
     x1, y1, x2, y2 = [float(value) for value in box]
     dx, dy = (x2 - x1) * context, (y2 - y1) * context
@@ -85,8 +105,20 @@ def _boxes_for_time(
 ) -> dict[int, list[float]]:
     frame_index = int(round(timestamp * video_fps))
     result: dict[int, list[float]] = {}
-    for detection in tracks_by_frame.get(frame_index, []):
-        fighter = canonical_fighter_for_track(fighter_map, int(detection["track_id"]), timestamp)
+    detections: list[dict[str, Any]] = []
+    for radius in range(0, 7):
+        candidate_frames = [frame_index] if radius == 0 else [frame_index - radius, frame_index + radius]
+        for candidate_frame in candidate_frames:
+            if tracks_by_frame.get(candidate_frame):
+                detections = tracks_by_frame[candidate_frame]
+                break
+        if detections:
+            break
+    for detection in detections:
+        fighter_value = detection.get("fighter_id")
+        fighter = int(fighter_value) if fighter_value is not None else canonical_fighter_for_track(
+            fighter_map, int(detection["track_id"]), timestamp
+        )
         if fighter is not None:
             result[int(fighter)] = list(detection["bbox_xyxy"])
     return result
@@ -101,21 +133,35 @@ def _composite_frames(
     video_fps: float,
     tracks_by_frame: dict[int, list[dict[str, Any]]],
     fighter_map: dict[str, Any],
-    maximum: int = 18,
-) -> list[np.ndarray]:
+    maximum: int = 24,
+) -> tuple[list[np.ndarray], dict[str, Any]]:
     capture = cv2.VideoCapture(str(video))
     if not capture.isOpened():
         raise PipelineError(f"Cannot open video: {video}")
-    count = min(maximum, max(1, int(np.floor((end - start) * sample_fps)) + 1))
-    timestamps = np.linspace(start, end, count, endpoint=True)
+    count = min(maximum, max(1, int(np.ceil((end - start) * sample_fps))))
+    # Preserve the declared temporal cadence. Linspace including both window
+    # endpoints would turn a requested 8 FPS clip into 7.67 FPS over 3 s and
+    # shift the model's timestamp grounding.
+    timestamps = np.minimum(end, start + np.arange(count, dtype=np.float64) / sample_fps)
     frames: list[np.ndarray] = []
+    requested_frames = len(timestamps)
+    decoded_frames = 0
+    actor_box_frames = 0
+    opponent_box_frames = 0
     try:
         for timestamp in timestamps:
             capture.set(cv2.CAP_PROP_POS_MSEC, float(timestamp) * 1000.0)
             ok, frame = capture.read()
             if not ok:
                 continue
+            decoded_frames += 1
             boxes = _boxes_for_time(tracks_by_frame, fighter_map, float(timestamp), video_fps)
+            if actor_id not in boxes:
+                # Never let the full scene silently masquerade as the actor
+                # crop. Such windows generated confident labels for the wrong
+                # fighter and many valid-looking zero-action responses.
+                continue
+            actor_box_frames += 1
             scene = frame.copy()
             for fighter, box in boxes.items():
                 color = (60, 210, 150) if fighter == actor_id else (60, 150, 250)
@@ -124,6 +170,8 @@ def _composite_frames(
                 cv2.putText(scene, f"fighter {fighter}", (x1, max(20, y1 - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
             cv2.putText(scene, f"t={float(timestamp):.3f}s", (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2)
             opponent_id = 1 - actor_id if actor_id in (0, 1) else -1
+            if opponent_id in boxes:
+                opponent_box_frames += 1
             composite = np.zeros((448, 448, 3), dtype=np.uint8)
             composite[:252] = _letterbox(scene, 448, 252)
             composite[252:] = np.concatenate([
@@ -135,7 +183,16 @@ def _composite_frames(
             frames.append(cv2.cvtColor(composite, cv2.COLOR_BGR2RGB))
     finally:
         capture.release()
-    return frames
+    denominator = max(decoded_frames, 1)
+    return frames, {
+        "requested_frames": requested_frames,
+        "decoded_frames": decoded_frames,
+        "composite_frames": len(frames),
+        "actor_box_frames": actor_box_frames,
+        "opponent_box_frames": opponent_box_frames,
+        "actor_crop_coverage": round(actor_box_frames / denominator, 6),
+        "opponent_crop_coverage": round(opponent_box_frames / denominator, 6),
+    }
 
 
 def build_scan_tasks(
@@ -149,18 +206,39 @@ def build_scan_tasks(
     tasks: list[dict[str, Any]] = []
     covered: dict[int, list[tuple[float, float]]] = {fighter: [] for fighter in range(expected_fighters)}
     if scan_mode in {"candidates", "hybrid"}:
-        for row in rows:
+        candidate_tasks: dict[int, list[dict[str, Any]]] = {fighter: [] for fighter in range(expected_fighters)}
+        for row in sorted(rows, key=lambda item: (int(item.get("actor_id", -1)), float(item.get("peak_sec", 0.0)))):
             actor = int(row.get("actor_id", -1))
             if actor not in covered:
                 continue
             peak = float(row.get("peak_sec", 0.0))
+            margin = min(0.40, window_seconds * 0.15)
+            existing = next(
+                (
+                    task for task in candidate_tasks[actor]
+                    if float(task["start_sec"]) + margin <= peak <= float(task["end_sec"]) - margin
+                ),
+                None,
+            )
+            if existing is not None:
+                existing["source_event_ids"].append(str(row.get("event_id", "")))
+                if float(row.get("proposal_confidence", row.get("actionness_score", 0.0))) > float(
+                    existing["source"].get("proposal_confidence", existing["source"].get("actionness_score", 0.0))
+                ):
+                    existing["source"] = row
+                continue
             start = max(0.0, min(duration - min(window_seconds, duration), peak - window_seconds / 2))
             end = min(duration, start + window_seconds)
             covered[actor].append((start, end))
-            tasks.append({
-                "task_id": f"candidate_{len(tasks) + 1:06d}", "kind": "candidate", "actor_id": actor,
+            task = {
+                "task_id": "", "kind": "candidate", "actor_id": actor,
                 "start_sec": start, "end_sec": end, "source": row,
-            })
+                "source_event_ids": [str(row.get("event_id", ""))],
+            }
+            candidate_tasks[actor].append(task)
+            tasks.append(task)
+        for index, task in enumerate(tasks, start=1):
+            task["task_id"] = f"candidate_{index:06d}"
     if scan_mode in {"dense", "hybrid"}:
         for actor in range(expected_fighters):
             center = min(window_seconds / 2, duration / 2)
@@ -190,12 +268,20 @@ def _candidate_list(value: Any, technique: str, confidence: float, allowed: set[
                 score = float(item.get("confidence", 0.0))
             else:
                 continue
+            label = _normalize_technique(label)
             if label in allowed:
                 candidates.append({"technique": label, "confidence": round(max(0.0, min(1.0, score)), 6), "source": "qwen_actions"})
     if technique in allowed and not any(item["technique"] == technique for item in candidates):
         candidates.append({"technique": technique, "confidence": round(confidence, 6), "source": "qwen_actions"})
     candidates.sort(key=lambda item: float(item["confidence"]), reverse=True)
     return candidates[:3]
+
+
+def _normalize_technique(value: Any) -> str:
+    label = str(value or "unknown_action").strip().lower().replace("-", "_").replace(" ", "_")
+    while "__" in label:
+        label = label.replace("__", "_")
+    return TECHNIQUE_ALIASES.get(label, label)
 
 
 def normalize_events(
@@ -220,7 +306,7 @@ def normalize_events(
         if end_offset - start_offset < 0.03:
             continue
         confidence = max(0.0, min(1.0, float(prediction.get("confidence", 0.0))))
-        technique = str(prediction.get("technique", "unknown_action"))
+        technique = _normalize_technique(prediction.get("technique", "unknown_action"))
         if technique not in allowed_techniques:
             technique = "unknown_action"
         candidates = _candidate_list(prediction.get("technique_candidates"), technique, confidence, allowed_techniques)
@@ -235,6 +321,7 @@ def normalize_events(
             limb = DEFAULT_LIMB.get(family, "unknown")
         base = dict(source) if isinstance(source, dict) else {}
         event_id = f"qwen_{task['task_id']}_{index:02d}"
+        proxy_fps = float(manifest.get("proxy_video", {}).get("fps", base.get("proxy_fps", 30.0)))
         value = {
             **base,
             "event_id": event_id,
@@ -246,6 +333,10 @@ def normalize_events(
             "start_sec": round(window_start + start_offset, 6),
             "peak_sec": round(window_start + peak_offset, 6),
             "end_sec": round(window_start + end_offset, 6),
+            "proxy_fps": proxy_fps,
+            "proxy_start_frame": int(round((window_start + start_offset) * proxy_fps)),
+            "proxy_peak_frame": int(round((window_start + peak_offset) * proxy_fps)),
+            "proxy_end_frame": int(round((window_start + end_offset) * proxy_fps)),
             "technique": technique,
             "label": technique,
             "technique_candidates": candidates,
@@ -272,6 +363,8 @@ def normalize_events(
             "provenance": {
                 "source": "qwen_actions", "task_id": task["task_id"], "scan_kind": task["kind"],
                 "window_start_sec": window_start, "window_end_sec": window_end,
+                "source_pose_event_id": source.get("event_id") if isinstance(source, dict) else None,
+                "source_pose_event_ids": list(task.get("source_event_ids", [])),
             },
         }
         results.append(value)
@@ -286,11 +379,55 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--scan-mode", choices=("candidates", "hybrid", "dense"), default="hybrid")
     parser.add_argument("--window-seconds", type=float, default=3.0)
     parser.add_argument("--hop-seconds", type=float, default=1.5)
-    parser.add_argument("--fps", type=float, default=6.0)
+    parser.add_argument("--fps", type=float, default=8.0)
     parser.add_argument("--limit", type=int, default=0)
     parser.add_argument("--device", default="cuda:0")
+    parser.add_argument("--vision-mode", choices=("video", "frames"), default="video")
+    parser.add_argument("--minimum-actor-crop-coverage", type=float, default=0.60)
+    parser.add_argument("--debug-previews", type=int, default=12)
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args()
+
+
+def _model_inputs(processor: Any, images: list[np.ndarray], prompt: str, vision_mode: str, sample_fps: float) -> tuple[Any, str]:
+    """Prepare temporally ordered Qwen input, with an explicit frame fallback."""
+    if vision_mode == "video":
+        from PIL import Image
+        from qwen_vl_utils import process_vision_info
+
+        messages = [{"role": "user", "content": [
+            {"type": "video", "video": [Image.fromarray(image) for image in images], "sample_fps": sample_fps},
+            {"type": "text", "text": prompt},
+        ]}]
+        text_prompt = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        image_inputs, video_inputs, video_kwargs = process_vision_info(
+            messages,
+            image_patch_size=16,
+            return_video_kwargs=True,
+            return_video_metadata=True,
+        )
+        video_metadata = None
+        if video_inputs:
+            video_inputs, video_metadata = zip(*video_inputs)
+            video_inputs, video_metadata = list(video_inputs), list(video_metadata)
+        inputs = processor(
+            text=[text_prompt],
+            images=image_inputs,
+            videos=video_inputs,
+            video_metadata=video_metadata,
+            do_resize=False,
+            padding=True,
+            return_tensors="pt",
+            **video_kwargs,
+        )
+        return inputs, "video"
+
+    messages = [{"role": "user", "content": [
+        *[{"type": "image", "image": image} for image in images],
+        {"type": "text", "text": prompt},
+    ]}]
+    text_prompt = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    return processor(text=[text_prompt], images=images, padding=True, return_tensors="pt"), "frames"
 
 
 def main() -> int:
@@ -305,6 +442,8 @@ def main() -> int:
             raise PipelineError(f"Local Qwen model directory not found: {model_path}")
         if args.window_seconds <= 0 or args.hop_seconds <= 0 or args.fps <= 0:
             raise PipelineError("window, hop and FPS must be positive")
+        if not 0.0 <= args.minimum_actor_crop_coverage <= 1.0:
+            raise PipelineError("--minimum-actor-crop-coverage must be between 0 and 1")
         source_path = args.input.expanduser().resolve() if args.input else project / "proposals" / "branches" / "pose_attributes.jsonl"
         output = project / "proposals" / "branches" / "qwen_actions.jsonl"
         if output.exists() and output.stat().st_size and not args.overwrite:
@@ -340,35 +479,73 @@ def main() -> int:
         techniques = ", ".join(schema["primary_action_classes"])
         raw_dir = project / "proposals" / "raw" / "qwen"
         raw_dir.mkdir(parents=True, exist_ok=True)
+        preview_dir = raw_dir / "previews"
+        preview_dir.mkdir(parents=True, exist_ok=True)
         outputs: list[dict[str, Any]] = []
         failures = 0
+        parse_failures = 0
+        crop_failures = 0
+        valid_zero_event_tasks = 0
+        model_calls = 0
+        used_modes: dict[str, int] = {"video": 0, "frames": 0}
+        previews_written = 0
         for task_index, task in enumerate(tasks, start=1):
-            images = _composite_frames(
+            images, crop_stats = _composite_frames(
                 video, float(task["start_sec"]), float(task["end_sec"]), args.fps,
                 int(task["actor_id"]), video_fps, tracks_by_frame, fighter_map,
             )
-            record: dict[str, Any] = {"task": {key: value for key, value in task.items() if key != "source"}, "source_event_id": task.get("source", {}).get("event_id") if isinstance(task.get("source"), dict) else None, "frame_count": len(images)}
+            record: dict[str, Any] = {
+                "task": {key: value for key, value in task.items() if key != "source"},
+                "source_event_id": task.get("source", {}).get("event_id") if isinstance(task.get("source"), dict) else None,
+                "frame_count": len(images),
+                "crop_stats": crop_stats,
+            }
             if not images:
-                record["error"] = "no frames decoded"
+                record["error"] = "no actor-targeted frames decoded"
                 failures += 1
+                crop_failures += 1
                 write_json(raw_dir / f"{task['task_id']}.json", record)
                 continue
+            if float(crop_stats["actor_crop_coverage"]) < args.minimum_actor_crop_coverage:
+                record["error"] = "insufficient_actor_crop_coverage"
+                failures += 1
+                crop_failures += 1
+                write_json(raw_dir / f"{task['task_id']}.json", record)
+                continue
+            if previews_written < max(0, args.debug_previews):
+                preview = np.concatenate([cv2.cvtColor(image, cv2.COLOR_RGB2BGR) for image in images[:4]], axis=1)
+                cv2.imwrite(str(preview_dir / f"{task['task_id']}.jpg"), preview)
+                previews_written += 1
             base_prompt = PROMPT.format(
                 window_start=float(task["start_sec"]), window_end=float(task["end_sec"]),
                 fps=args.fps, actor_id=int(task["actor_id"]), techniques=techniques,
             )
+            source = task.get("source")
+            if isinstance(source, dict):
+                base_prompt += (
+                    "\nPose evidence (a hint, not truth): "
+                    f"peak={source.get('peak_sec')}s; effector={source.get('pose_effector_id', source.get('effector_id'))}; "
+                    f"family_candidates={source.get('family_candidates', [])}."
+                )
             raw = ""
             payload: dict[str, Any] | None = None
             parse_error = ""
+            input_errors: list[str] = []
+            mode_used = args.vision_mode
             for attempt in range(2):
-                prompt = base_prompt if attempt == 0 else base_prompt + "\nYour previous response was invalid JSON. Return only the corrected object."
-                messages = [{"role": "user", "content": [
-                    *[{"type": "image", "image": image} for image in images],
-                    {"type": "text", "text": prompt},
-                ]}]
-                text_prompt = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-                inputs = processor(text=[text_prompt], images=images, padding=True, return_tensors="pt")
+                prompt = base_prompt if attempt == 0 else (
+                    base_prompt + f"\nYour previous response could not be parsed ({parse_error}). "
+                    "Return only one corrected JSON object beginning with { and ending with }."
+                )
+                try:
+                    inputs, mode_used = _model_inputs(processor, images, prompt, args.vision_mode, args.fps)
+                except Exception as exc:
+                    if args.vision_mode != "video":
+                        raise
+                    input_errors.append(f"video input failed: {type(exc).__name__}: {exc}")
+                    inputs, mode_used = _model_inputs(processor, images, prompt, "frames", args.fps)
                 inputs = {key: value.to(model.device) if hasattr(value, "to") else value for key, value in inputs.items()}
+                model_calls += 1
                 with torch.inference_mode():
                     generated = model.generate(**inputs, max_new_tokens=768, do_sample=False)
                 trimmed = generated[:, inputs["input_ids"].shape[1]:]
@@ -379,11 +556,21 @@ def main() -> int:
                     break
                 except (ValueError, json.JSONDecodeError) as exc:
                     parse_error = str(exc)
-            record.update({"raw_output": raw, "parse_error": parse_error, "parsed": payload})
+            used_modes[mode_used] = used_modes.get(mode_used, 0) + 1
+            record.update({
+                "raw_output": raw,
+                "parse_error": parse_error,
+                "input_warnings": input_errors,
+                "vision_mode": mode_used,
+                "parsed": payload,
+            })
             if payload is None:
                 failures += 1
+                parse_failures += 1
             else:
                 events = normalize_events(payload, task, manifest, schema)
+                if not events:
+                    valid_zero_event_tasks += 1
                 record["normalized_event_ids"] = [event["event_id"] for event in events]
                 outputs.extend(events)
             write_json(raw_dir / f"{task['task_id']}.json", record)
@@ -392,7 +579,20 @@ def main() -> int:
 
         outputs.sort(key=lambda row: (float(row["start_sec"]), int(row["actor_id"]), float(row["peak_sec"])))
         write_jsonl(output, outputs)
-        summary = {"tasks": len(tasks), "events": len(outputs), "failures": failures, "scan_mode": args.scan_mode, "model": str(model_path), "local_only": True}
+        summary = {
+            "tasks": len(tasks),
+            "events": len(outputs),
+            "failures": failures,
+            "parse_failures": parse_failures,
+            "insufficient_actor_crop_tasks": crop_failures,
+            "valid_zero_event_tasks": valid_zero_event_tasks,
+            "model_calls": model_calls,
+            "vision_modes": used_modes,
+            "debug_previews": previews_written,
+            "scan_mode": args.scan_mode,
+            "model": str(model_path),
+            "local_only": True,
+        }
         write_json(raw_dir / "summary.json", summary)
         print(json.dumps({**summary, "output": str(output), "raw_dir": str(raw_dir)}, indent=2))
         return 0

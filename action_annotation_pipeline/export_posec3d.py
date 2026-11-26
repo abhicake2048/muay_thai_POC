@@ -48,6 +48,7 @@ def make_annotation(
     pose_data: Any,
     fighter_map: dict[str, Any],
     sample_frames: int = 0,
+    canonical_lookup: bool = False,
 ) -> dict[str, Any]:
     first_frame = max(0, int(np.floor(start * fps)))
     last_frame = max(first_frame, int(np.ceil(end * fps)))
@@ -63,10 +64,13 @@ def make_annotation(
         for person_slot, fighter_id in enumerate((actor, target)):
             if fighter_id not in (0, 1):
                 continue
-            raw_track = raw_track_for_fighter(fighter_map, fighter_id, timestamp)
-            if raw_track is None:
-                continue
-            pose_index = pose_lookup.get((int(frame_index), int(raw_track)))
+            if canonical_lookup:
+                pose_index = pose_lookup.get((int(frame_index), int(fighter_id)))
+            else:
+                raw_track = raw_track_for_fighter(fighter_map, fighter_id, timestamp)
+                if raw_track is None:
+                    continue
+                pose_index = pose_lookup.get((int(frame_index), int(raw_track)))
             if pose_index is None:
                 continue
             keypoint[person_slot, time_index] = pose_data["keypoints"][pose_index]
@@ -101,9 +105,11 @@ def main() -> int:
         if not pose_path.is_file():
             raise PipelineError(f"Pose file not found: {pose_path}")
         pose_data = np.load(pose_path)
+        has_canonical_fighters = "fighter_ids" in pose_data.files
+        lookup_id_values = pose_data["fighter_ids"] if has_canonical_fighters else pose_data["track_ids"]
         pose_lookup = {
-            (int(frame), int(track)): index
-            for index, (frame, track) in enumerate(zip(pose_data["frame_indices"], pose_data["track_ids"]))
+            (int(frame), int(identity)): index
+            for index, (frame, identity) in enumerate(zip(pose_data["frame_indices"], lookup_id_values))
         }
         fps = float(manifest["proxy_video"]["fps"])
         width = int(manifest["proxy_video"]["width"])
@@ -132,6 +138,7 @@ def main() -> int:
             annotation = make_annotation(
                 sample_id, start, end, int(event["actor_id"]), int(event.get("target_id", -1)),
                 label_map[label], fps, width, height, pose_lookup, pose_data, fighter_map, args.num_frames,
+                canonical_lookup=has_canonical_fighters,
             )
             annotation["source_event_id"] = str(event["event_id"])
             annotation["attribute_labels"] = {}
@@ -176,6 +183,7 @@ def main() -> int:
             annotations.append(make_annotation(
                 sample_id, start, end, actor, target, label_map["background"], fps, width, height,
                 pose_lookup, pose_data, fighter_map, args.num_frames,
+                canonical_lookup=has_canonical_fighters,
             ))
             annotations[-1]["source_event_id"] = None
             annotations[-1]["attribute_labels"] = {name: -1 for name in attribute_maps}
@@ -198,6 +206,26 @@ def main() -> int:
             "attribute_classes": attribute_values, "attribute_to_id": attribute_maps,
             "masked_multitask_contract": "Use label for technique CE. For each attribute, compute CE only where attribute_masks[head] is true."
         })
+        write_json(output_dir / "augmentation_policy.json", {
+            "apply_at_training_time_only": True,
+            "apply_after_source_video_split": True,
+            "policy": {
+                "temporal_center_jitter_sec": [-0.12, 0.12],
+                "temporal_speed_range": [0.90, 1.10],
+                "spatial_scale_range": [0.90, 1.10],
+                "rotation_degrees": [-8.0, 8.0],
+                "translation_fraction": [-0.02, 0.02],
+                "keypoint_noise_sigma_fraction": 0.004,
+                "keypoint_dropout_probability": 0.03,
+                "horizontal_flip": False,
+            },
+            "safety_notes": [
+                "Do not augment validation or test samples.",
+                "Do not create augmented copies before source-video grouping.",
+                "Horizontal flip is disabled because side/stance attributes require synchronized semantic handling.",
+                "Keep actor in slot 0 and opponent in slot 1 after every transform.",
+            ],
+        })
         write_jsonl(output_dir / "sample_metadata.jsonl", metadata_rows)
         summary = {
             "samples": len(annotations), "action_samples": len(verified_actions),
@@ -207,6 +235,8 @@ def main() -> int:
             "split_warning": "All samples belong to one source video and must remain in one split.",
             "reviewed_duration_sec": report["reviewed_duration_sec"],
             "uniform_sample_frames": args.num_frames,
+            "identity_lookup": "canonical_fighter_id" if has_canonical_fighters else "legacy_raw_track_segments",
+            "augmentation_policy": str(output_dir / "augmentation_policy.json"),
             "tensor_contract": {"keypoint": [2, args.num_frames or "T", 17, 2], "keypoint_score": [2, args.num_frames or "T", 17]},
         }
         write_json(output_dir / "summary.json", summary)

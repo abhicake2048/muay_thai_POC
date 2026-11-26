@@ -141,6 +141,23 @@ def validate(project: Path, events_path: Path, require_full_review: bool, allow_
         counts[f"{event_type}:{label}:{status}"] += 1
 
     merged_review = merge_intervals(review_ranges)
+    verified_atomic_actions = [event for event in verified_actions if event.get("event_type") == "action"]
+    for left_index, left in enumerate(verified_atomic_actions):
+        for right in verified_atomic_actions[left_index + 1:]:
+            if int(left.get("actor_id", -1)) != int(right.get("actor_id", -2)):
+                continue
+            if str(left.get("technique")) != str(right.get("technique")):
+                continue
+            if str(left.get("effector_id")) != str(right.get("effector_id")):
+                continue
+            intersection = max(0.0, min(float(left["end_sec"]), float(right["end_sec"])) - max(float(left["start_sec"]), float(right["start_sec"])))
+            union = max(float(left["end_sec"]), float(right["end_sec"])) - min(float(left["start_sec"]), float(right["start_sec"]))
+            temporal_iou = intersection / union if union > 0 else 0.0
+            if temporal_iou >= 0.80:
+                errors.append(
+                    f"{left['event_id']} and {right['event_id']}: probable duplicate verified actions "
+                    f"(same actor/technique/effector, temporal IoU={temporal_iou:.3f})"
+                )
     if verified_actions and not merged_review:
         errors.append("Verified actions exist but no verified review_range was annotated")
     for event in verified_actions:

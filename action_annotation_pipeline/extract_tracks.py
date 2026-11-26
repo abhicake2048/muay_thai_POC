@@ -6,6 +6,7 @@ import argparse
 import hashlib
 import json
 import math
+import shutil
 import sys
 from collections import defaultdict
 from datetime import datetime, timezone
@@ -16,6 +17,7 @@ import cv2
 import numpy as np
 
 from common import PipelineError, load_manifest, read_json, write_json, write_jsonl
+from fighter_identity import stitch_fighter_tracks
 
 
 COLORS = [(52, 211, 153), (251, 146, 60), (96, 165, 250), (244, 114, 182)]
@@ -104,6 +106,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-detections", type=int, default=6)
     parser.add_argument("--max-frames", type=int, default=0, help="Testing only; 0 processes all frames")
     parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument(
+        "--replace-fighter-map",
+        action="store_true",
+        help="Replace even a verified/modified map after saving a timestamped backup",
+    )
     return parser.parse_args()
 
 
@@ -135,6 +142,39 @@ def _was_automatic_map(existing: dict[str, Any], previous_suggested: dict[str, A
     )
 
 
+def _write_canonical_overlay(
+    video: Path,
+    records: list[dict[str, Any]],
+    output: Path,
+    fps: float,
+    width: int,
+    height: int,
+) -> None:
+    capture = cv2.VideoCapture(str(video))
+    writer = cv2.VideoWriter(str(output), cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
+    if not capture.isOpened() or not writer.isOpened():
+        capture.release()
+        writer.release()
+        raise PipelineError(f"Cannot create canonical fighter overlay: {output}")
+    try:
+        for row in records:
+            ok, frame = capture.read()
+            if not ok:
+                break
+            for detection in row.get("detections", []):
+                fighter = detection.get("fighter_id")
+                color = COLORS[int(fighter) % len(COLORS)] if fighter is not None else (125, 125, 125)
+                x1, y1, x2, y2 = [round(float(value)) for value in detection["bbox_xyxy"]]
+                cv2.rectangle(frame, (x1, y1), (x2, y2), color, 3 if fighter is not None else 1)
+                label = f"fighter {fighter} / raw {detection['track_id']}" if fighter is not None else f"unassigned raw {detection['track_id']}"
+                cv2.putText(frame, label, (x1, max(22, y1 - 7)), cv2.FONT_HERSHEY_SIMPLEX, 0.52, color, 2, cv2.LINE_AA)
+            cv2.putText(frame, f"frame {row['frame_index']}  {float(row['timestamp']):.3f}s", (12, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.62, (255, 255, 255), 2, cv2.LINE_AA)
+            writer.write(frame)
+    finally:
+        capture.release()
+        writer.release()
+
+
 def main() -> int:
     args = parse_args()
     try:
@@ -148,6 +188,7 @@ def main() -> int:
             raise PipelineError(f"Missing proxy or YOLO weights: {video}, {weights}")
         tracks_path = project / "tracks" / "tracks.jsonl"
         overlay_path = project / "qa" / "tracks_overlay.mp4"
+        raw_overlay_path = project / "qa" / "tracks_raw_overlay.mp4"
         if tracks_path.exists() and not args.overwrite:
             raise PipelineError(f"Tracks already exist: {tracks_path}; pass --overwrite to replace")
 
@@ -160,11 +201,11 @@ def main() -> int:
         height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
         total = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
         writer = cv2.VideoWriter(
-            str(overlay_path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height)
+            str(raw_overlay_path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height)
         )
         if not writer.isOpened():
             capture.release()
-            raise PipelineError(f"Cannot create overlay: {overlay_path}")
+            raise PipelineError(f"Cannot create raw-track overlay: {raw_overlay_path}")
         simple_tracker = SimpleFighterTracker(width, height) if args.tracker == "simple" else None
 
         confidence = args.confidence
@@ -247,7 +288,16 @@ def main() -> int:
 
         if not records:
             raise PipelineError("No frames were decoded")
+        expected_fighters = int(manifest.get("expected_fighters", 2))
+        stitched_fighters, identity_report = stitch_fighter_tracks(
+            records,
+            width,
+            height,
+            fps,
+            expected_fighters=expected_fighters,
+        )
         write_jsonl(tracks_path, records)
+        _write_canonical_overlay(video, records, overlay_path, fps, width, height)
 
         ranked: list[dict[str, Any]] = []
         for track_id, item in stats.items():
@@ -268,7 +318,8 @@ def main() -> int:
             })
         ranked.sort(key=lambda value: value["selection_score"], reverse=True)
         write_json(project / "tracks" / "track_summary.json", {"tracks": ranked})
-        chosen = ranked[: int(manifest.get("expected_fighters", 2))]
+        chosen = ranked[:expected_fighters]
+        write_json(project / "tracks" / "fighter_identity_report.json", identity_report)
         fighter_map = {
             "schema_version": "2.0",
             "review_status": "suggested",
@@ -278,15 +329,10 @@ def main() -> int:
             "proxy_duration_sec": float(manifest["proxy_video"]["duration_sec"]),
             "source_tracks": str(tracks_path),
             "source_tracks_sha256": _sha256(tracks_path),
-            "instructions": "Verify these suggested raw track IDs in tracks_overlay.mp4. If an ID switches, split track_segments at the switch time.",
-            "fighters": [
-                {
-                    "fighter_id": index,
-                    "name": f"fighter_{index}",
-                    "track_segments": [{"track_id": int(value["track_id"]), "start_sec": 0.0, "end_sec": float(records[-1]["timestamp"])}],
-                }
-                for index, value in enumerate(chosen)
-            ],
+            "identity_method": identity_report["method"],
+            "identity_report": str(project / "tracks" / "fighter_identity_report.json"),
+            "instructions": "Verify canonical fighter_id assignments and every stitched raw-track segment. Correct crossings or ID swaps before marking review_status=verified.",
+            "fighters": stitched_fighters,
         }
         suggested_path = project / "tracks" / "fighter_map.suggested.json"
         previous_suggested = read_json(suggested_path) if suggested_path.is_file() else None
@@ -297,12 +343,18 @@ def main() -> int:
             write_json(final_map, fighter_map)
         else:
             existing = read_json(final_map)
-            if _was_automatic_map(existing, previous_suggested):
+            if args.replace_fighter_map:
+                backup_stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+                backup = project / "tracks" / f"fighter_map.backup.{backup_stamp}.json"
+                shutil.copy2(final_map, backup)
+                write_json(final_map, fighter_map)
+                map_action = f"forced_refresh_backup={backup.name}"
+            elif _was_automatic_map(existing, previous_suggested):
                 write_json(final_map, fighter_map)
                 map_action = "refreshed_automatic"
             else:
                 map_action = "preserved_reviewed_or_modified"
-        print(json.dumps({"frames": len(records), "tracks": len(ranked), "suggested_fighters": chosen, "tracks_file": str(tracks_path), "overlay": str(overlay_path), "fighter_map": str(final_map), "fighter_map_action": map_action}, indent=2))
+        print(json.dumps({"frames": len(records), "tracks": len(ranked), "legacy_top_tracks": chosen, "identity_stitching": identity_report, "tracks_file": str(tracks_path), "overlay": str(overlay_path), "raw_track_overlay": str(raw_overlay_path), "fighter_map": str(final_map), "fighter_map_action": map_action}, indent=2))
         return 0
     except (ImportError, OSError, ValueError, PipelineError) as exc:
         print(f"Error: {exc}", file=sys.stderr)
